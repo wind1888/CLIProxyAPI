@@ -82,15 +82,14 @@ When you use a pronoun for someone — the user or anyone else you mention — a
 // ClaudeCodeOutputEfficiency is kept for older call sites that used the previous section name.
 const ClaudeCodeOutputEfficiency = ClaudeCodeTextOutput
 
-// ClaudeCodeStaticSystemPrompt is the full static Claude Code prompt block sent
-// after the billing header and identity blocks when full prompt cloaking is enabled.
+// ClaudeCodeStaticSystemPrompt is Claude Code's system[2] static prompt block.
+// Text-output guidance starts the separate dynamic system[3] block.
 const ClaudeCodeStaticSystemPrompt = ClaudeCodeIntro + "\n\n" +
 	ClaudeCodeSystem + "\n\n" +
 	ClaudeCodeDoingTasks + "\n\n" +
 	ClaudeCodeExecutingActionsWithCare + "\n\n" +
 	ClaudeCodeUsingTools + "\n\n" +
-	ClaudeCodeToneAndStyle + "\n\n" +
-	ClaudeCodeTextOutput
+	ClaudeCodeToneAndStyle
 
 // ClaudeCodeSystemReminderSection corresponds to getSystemRemindersSection() in prompts.ts.
 const ClaudeCodeSystemReminderSection = `- Tool results and user messages may include <system-reminder> tags. <system-reminder> tags contain useful information and reminders. They are automatically added by the system, and bear no direct relation to the specific tool results or user messages in which they appear.

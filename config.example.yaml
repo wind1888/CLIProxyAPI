@@ -325,8 +325,6 @@ nonstream-keepalive-interval: 0
 #         - "API"
 #         - "proxy"
 #       cache-user-id: true          # optional: default is true; set false to generate a fresh Claude Code device_id each cloaked request
-#     experimental-cch-signing: false # optional: default is false; when true, sign the final /v1/messages body using the current Claude Code cch algorithm
-#                                     # keep this disabled unless you explicitly need the behavior, so upstream seed changes fall back to legacy proxy behavior
 
 # Default headers for Claude API requests. Update when Claude Code releases new versions.
 # In legacy mode, user-agent/package-version/runtime-version/timeout are used as fallbacks
@@ -335,7 +333,7 @@ nonstream-keepalive-interval: 0
 # while user-agent/package-version/runtime-version seed a software fingerprint that can
 # still upgrade to newer official Claude client versions.
 # claude-header-defaults:
-#   user-agent: "claude-cli/2.1.215 (external, cli)"
+#   user-agent: "claude-cli/2.1.215 (external, sdk-cli)"
 #   package-version: "0.94.0"
 #   runtime-version: "v26.3.0"
 #   os: "MacOS"

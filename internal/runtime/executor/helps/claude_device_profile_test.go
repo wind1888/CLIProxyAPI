@@ -235,3 +235,11 @@ func TestResolveClaudeDeviceProfileRequiredNonHomeKeepsLocalCache(t *testing.T) 
 		t.Fatalf("KV calls = get %d set %d setnx %d, want all zero", client.getCount, client.setCount, client.setNXCount)
 	}
 }
+
+func TestClaudeDeviceProfileOAuthScopeSurvivesTokenRotationWithoutAuthID(t *testing.T) {
+	first := &cliproxyauth.Auth{Metadata: map[string]any{"access_token": "oauth-token-one", "auth_kind": "oauth"}}
+	second := &cliproxyauth.Auth{Attributes: map[string]string{"access_token": "oauth-token-two", "auth_kind": "oauth"}}
+	if firstKey, secondKey := claudeDeviceProfileCacheKey(first, "oauth-token-one"), claudeDeviceProfileCacheKey(second, "oauth-token-two"); firstKey != secondKey {
+		t.Fatalf("OAuth device profile key changed after token rotation: %q != %q", firstKey, secondKey)
+	}
+}

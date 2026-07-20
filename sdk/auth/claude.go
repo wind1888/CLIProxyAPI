@@ -196,13 +196,19 @@ waitForCallback:
 
 	tokenStorage := authSvc.CreateTokenStorage(authBundle)
 
-	if tokenStorage == nil || tokenStorage.Email == "" {
+	if tokenStorage == nil || tokenStorage.AccessToken == "" {
 		return nil, fmt.Errorf("claude token storage missing account information")
 	}
 
-	fileName := fmt.Sprintf("claude-%s.json", tokenStorage.Email)
+	fileName, errFileName := tokenStorage.TokenFileName()
+	if errFileName != nil {
+		return nil, errFileName
+	}
 	metadata := map[string]any{
-		"email": tokenStorage.Email,
+		"email":             tokenStorage.Email,
+		"account_uuid":      tokenStorage.AccountUUID,
+		"organization_uuid": tokenStorage.OrganizationUUID,
+		"auth_kind":         "oauth",
 	}
 
 	fmt.Println("Claude authentication successful")
@@ -216,5 +222,8 @@ waitForCallback:
 		FileName: fileName,
 		Storage:  tokenStorage,
 		Metadata: metadata,
+		Attributes: map[string]string{
+			"auth_kind": "oauth",
+		},
 	}, nil
 }

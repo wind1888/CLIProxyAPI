@@ -22,13 +22,18 @@ import (
 
 // OAuth configuration constants for Claude/Anthropic
 const (
-	AuthURL     = "https://claude.ai/oauth/authorize"
-	TokenURL    = "https://api.anthropic.com/v1/oauth/token"
+	AuthURL     = "https://claude.com/cai/oauth/authorize"
+	TokenURL    = "https://platform.claude.com/v1/oauth/token"
+	APIBaseURL  = "https://api.anthropic.com"
 	ClientID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 	RedirectURI = "http://localhost:54545/callback"
+	OAuthScope  = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 
-	claudeRefreshMinBackoff = 5 * time.Second
-	claudeRefreshMaxBackoff = 5 * time.Minute
+	claudeRefreshMinBackoff    = 5 * time.Second
+	claudeRefreshMaxBackoff    = 5 * time.Minute
+	claudeTokenExchangeTimeout = 30 * time.Second
+	claudeRefreshTimeout       = 30 * time.Second
+	claudeProfileTimeout       = 10 * time.Second
 )
 
 var (
@@ -131,11 +136,27 @@ type tokenResponse struct {
 	} `json:"account"`
 }
 
+// oauthProfileResponse is the identity subset returned by /api/oauth/profile.
+// Unlike the token endpoint, the profile endpoint names the account email field
+// "email". EmailAddress is retained as a defensive compatibility fallback.
+type oauthProfileResponse struct {
+	Account struct {
+		UUID         string `json:"uuid"`
+		Email        string `json:"email"`
+		EmailAddress string `json:"email_address"`
+	} `json:"account"`
+	Organization struct {
+		UUID string `json:"uuid"`
+	} `json:"organization"`
+}
+
 // ClaudeAuth handles Anthropic OAuth2 authentication flow.
 // It provides methods for generating authorization URLs, exchanging codes for tokens,
 // and refreshing expired tokens using PKCE for enhanced security.
 type ClaudeAuth struct {
 	httpClient *http.Client
+	tokenURL   string
+	apiBaseURL string
 }
 
 // NewClaudeAuth creates a new Anthropic authentication service.
@@ -172,7 +193,105 @@ func NewClaudeAuthWithProxyURL(cfg *config.Config, proxyURL string) *ClaudeAuth 
 	// Cloudflare's bot detection on Anthropic domains
 	return &ClaudeAuth{
 		httpClient: NewAnthropicHttpClient(sdkCfg),
+		tokenURL:   TokenURL,
+		apiBaseURL: APIBaseURL,
 	}
+}
+
+func (o *ClaudeAuth) resolvedTokenURL() string {
+	if o != nil {
+		if endpoint := strings.TrimSpace(o.tokenURL); endpoint != "" {
+			return endpoint
+		}
+	}
+	return TokenURL
+}
+
+func (o *ClaudeAuth) resolvedOAuthProfileURL() string {
+	baseURL := ""
+	if o != nil {
+		baseURL = strings.TrimSpace(o.apiBaseURL)
+	}
+	if baseURL == "" {
+		baseURL = APIBaseURL
+	}
+	return strings.TrimRight(baseURL, "/") + "/api/oauth/profile"
+}
+
+func tokenResponseNeedsProfile(tokenResp *tokenResponse) bool {
+	if tokenResp == nil {
+		return false
+	}
+	return strings.TrimSpace(tokenResp.Account.UUID) == "" ||
+		strings.TrimSpace(tokenResp.Account.EmailAddress) == "" ||
+		strings.TrimSpace(tokenResp.Organization.UUID) == ""
+}
+
+// backfillTokenIdentity supplements sparse token responses with the first-party
+// OAuth profile. Profile lookup is best-effort, matching Claude Code: a transient
+// profile failure must not discard an otherwise valid access token.
+func (o *ClaudeAuth) backfillTokenIdentity(ctx context.Context, tokenResp *tokenResponse) {
+	if !tokenResponseNeedsProfile(tokenResp) || strings.TrimSpace(tokenResp.AccessToken) == "" {
+		return
+	}
+
+	profile, err := o.fetchOAuthProfile(ctx, tokenResp.AccessToken)
+	if err != nil {
+		// fetchOAuthProfile deliberately returns sanitized errors that contain no
+		// credential or response body.
+		log.Warnf("Claude OAuth profile backfill failed: %v", err)
+		return
+	}
+
+	if strings.TrimSpace(tokenResp.Account.UUID) == "" {
+		tokenResp.Account.UUID = strings.TrimSpace(profile.Account.UUID)
+	}
+	if strings.TrimSpace(tokenResp.Account.EmailAddress) == "" {
+		tokenResp.Account.EmailAddress = strings.TrimSpace(profile.Account.Email)
+		if tokenResp.Account.EmailAddress == "" {
+			tokenResp.Account.EmailAddress = strings.TrimSpace(profile.Account.EmailAddress)
+		}
+	}
+	if strings.TrimSpace(tokenResp.Organization.UUID) == "" {
+		tokenResp.Organization.UUID = strings.TrimSpace(profile.Organization.UUID)
+	}
+}
+
+func (o *ClaudeAuth) fetchOAuthProfile(ctx context.Context, accessToken string) (*oauthProfileResponse, error) {
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" {
+		return nil, fmt.Errorf("OAuth profile request skipped: access token is empty")
+	}
+
+	profileCtx, cancel := context.WithTimeout(ctx, claudeProfileTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(profileCtx, http.MethodGet, o.resolvedOAuthProfileURL(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create OAuth profile request")
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Cache-Control", "no-cache")
+
+	resp, err := o.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("OAuth profile request failed")
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("OAuth profile request failed with status %d", resp.StatusCode)
+	}
+
+	var profile oauthProfileResponse
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, 1<<20))
+	if err = decoder.Decode(&profile); err != nil {
+		return nil, fmt.Errorf("failed to parse OAuth profile response")
+	}
+	return &profile, nil
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE.
@@ -197,7 +316,7 @@ func (o *ClaudeAuth) GenerateAuthURL(state string, pkceCodes *PKCECodes) (string
 		"client_id":             {ClientID},
 		"response_type":         {"code"},
 		"redirect_uri":          {RedirectURI},
-		"scope":                 {"user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"},
+		"scope":                 {OAuthScope},
 		"code_challenge":        {pkceCodes.CodeChallenge},
 		"code_challenge_method": {"S256"},
 		"state":                 {state},
@@ -266,7 +385,9 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 
 	// log.Debugf("Token exchange request: %s", string(jsonBody))
 
-	req, err := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(string(jsonBody)))
+	exchangeCtx, cancelExchange := context.WithTimeout(ctx, claudeTokenExchangeTimeout)
+	defer cancelExchange()
+	req, err := http.NewRequestWithContext(exchangeCtx, http.MethodPost, o.resolvedTokenURL(), strings.NewReader(string(jsonBody)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token request: %w", err)
 	}
@@ -298,13 +419,16 @@ func (o *ClaudeAuth) ExchangeCodeForTokens(ctx context.Context, code, state stri
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
+	o.backfillTokenIdentity(ctx, &tokenResp)
 
 	// Create token data
 	tokenData := ClaudeTokenData{
-		AccessToken:  tokenResp.AccessToken,
-		RefreshToken: tokenResp.RefreshToken,
-		Email:        tokenResp.Account.EmailAddress,
-		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
+		AccessToken:      tokenResp.AccessToken,
+		RefreshToken:     tokenResp.RefreshToken,
+		Email:            tokenResp.Account.EmailAddress,
+		AccountUUID:      tokenResp.Account.UUID,
+		OrganizationUUID: tokenResp.Organization.UUID,
+		Expire:           time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}
 
 	// Create auth bundle
@@ -365,6 +489,7 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 		"client_id":     ClientID,
 		"grant_type":    "refresh_token",
 		"refresh_token": refreshToken,
+		"scope":         OAuthScope,
 	}
 
 	jsonBody, err := json.Marshal(reqBody)
@@ -372,7 +497,9 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 		return nil, fmt.Errorf("failed to marshal request body: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, "POST", TokenURL, strings.NewReader(string(jsonBody)))
+	refreshCtx, cancelRefresh := context.WithTimeout(ctx, claudeRefreshTimeout)
+	defer cancelRefresh()
+	req, err := http.NewRequestWithContext(refreshCtx, http.MethodPost, o.resolvedTokenURL(), strings.NewReader(string(jsonBody)))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create refresh request: %w", err)
 	}
@@ -389,6 +516,7 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 	}()
 
 	body, err := io.ReadAll(resp.Body)
+	cancelRefresh()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read refresh response: %w", err)
 	}
@@ -413,15 +541,18 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 	if err = json.Unmarshal(body, &tokenResp); err != nil {
 		return nil, fmt.Errorf("failed to parse token response: %w", err)
 	}
+	o.backfillTokenIdentity(ctx, &tokenResp)
 
 	// Create token data
 	clearClaudeRefreshBlockedUntil(refreshToken)
 
 	return &ClaudeTokenData{
-		AccessToken:  tokenResp.AccessToken,
-		RefreshToken: tokenResp.RefreshToken,
-		Email:        tokenResp.Account.EmailAddress,
-		Expire:       time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
+		AccessToken:      tokenResp.AccessToken,
+		RefreshToken:     tokenResp.RefreshToken,
+		Email:            tokenResp.Account.EmailAddress,
+		AccountUUID:      tokenResp.Account.UUID,
+		OrganizationUUID: tokenResp.Organization.UUID,
+		Expire:           time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339),
 	}, nil
 }
 
@@ -436,11 +567,13 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
 //   - *ClaudeTokenStorage: A new token storage instance
 func (o *ClaudeAuth) CreateTokenStorage(bundle *ClaudeAuthBundle) *ClaudeTokenStorage {
 	storage := &ClaudeTokenStorage{
-		AccessToken:  bundle.TokenData.AccessToken,
-		RefreshToken: bundle.TokenData.RefreshToken,
-		LastRefresh:  bundle.LastRefresh,
-		Email:        bundle.TokenData.Email,
-		Expire:       bundle.TokenData.Expire,
+		AccessToken:      bundle.TokenData.AccessToken,
+		RefreshToken:     bundle.TokenData.RefreshToken,
+		LastRefresh:      bundle.LastRefresh,
+		Email:            bundle.TokenData.Email,
+		AccountUUID:      bundle.TokenData.AccountUUID,
+		OrganizationUUID: bundle.TokenData.OrganizationUUID,
+		Expire:           bundle.TokenData.Expire,
 	}
 
 	return storage
@@ -494,9 +627,22 @@ func (o *ClaudeAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken st
 //   - storage: The existing token storage to update
 //   - tokenData: The new token data to apply
 func (o *ClaudeAuth) UpdateTokenStorage(storage *ClaudeTokenStorage, tokenData *ClaudeTokenData) {
+	if storage == nil || tokenData == nil {
+		return
+	}
 	storage.AccessToken = tokenData.AccessToken
-	storage.RefreshToken = tokenData.RefreshToken
+	if tokenData.RefreshToken != "" {
+		storage.RefreshToken = tokenData.RefreshToken
+	}
 	storage.LastRefresh = time.Now().Format(time.RFC3339)
-	storage.Email = tokenData.Email
+	if tokenData.Email != "" {
+		storage.Email = tokenData.Email
+	}
+	if tokenData.AccountUUID != "" {
+		storage.AccountUUID = tokenData.AccountUUID
+	}
+	if tokenData.OrganizationUUID != "" {
+		storage.OrganizationUUID = tokenData.OrganizationUUID
+	}
 	storage.Expire = tokenData.Expire
 }

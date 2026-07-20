@@ -4,13 +4,37 @@
 package claude
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 )
+
+// TokenFileName returns a collision-resistant credential filename without
+// exposing the OAuth access token.
+func (ts *ClaudeTokenStorage) TokenFileName() (string, error) {
+	if ts == nil {
+		return "", fmt.Errorf("Claude token storage is nil")
+	}
+	identity := strings.TrimSpace(ts.Email)
+	if identity == "" {
+		identity = strings.TrimSpace(ts.AccountUUID)
+	}
+	if identity == "" {
+		accessToken := strings.TrimSpace(ts.AccessToken)
+		if accessToken == "" {
+			return "", fmt.Errorf("Claude token storage is missing account identity")
+		}
+		digest := sha256.Sum256([]byte(accessToken))
+		identity = fmt.Sprintf("oauth-%x", digest[:8])
+	}
+	identity = strings.NewReplacer("/", "_", "\\", "_").Replace(identity)
+	return "claude-" + identity + ".json", nil
+}
 
 // ClaudeTokenStorage stores OAuth2 token information for Anthropic Claude API authentication.
 // It maintains compatibility with the existing auth system while adding Claude-specific fields
@@ -30,6 +54,12 @@ type ClaudeTokenStorage struct {
 
 	// Email is the Anthropic account email address associated with this token.
 	Email string `json:"email"`
+
+	// AccountUUID is the stable Anthropic account identifier returned by OAuth.
+	AccountUUID string `json:"account_uuid"`
+
+	// OrganizationUUID is the stable Anthropic organization identifier returned by OAuth.
+	OrganizationUUID string `json:"organization_uuid"`
 
 	// Type indicates the authentication provider type, always "claude" for this storage.
 	Type string `json:"type"`
@@ -80,6 +110,17 @@ func (ts *ClaudeTokenStorage) SaveTokenToFile(authFilePath string) error {
 	if errMerge != nil {
 		return fmt.Errorf("failed to merge metadata: %w", errMerge)
 	}
+	// Typed OAuth fields are authoritative. Metadata may contain a stale copy
+	// loaded from an older credential file and must not roll back a refresh.
+	data["id_token"] = ts.IDToken
+	data["access_token"] = ts.AccessToken
+	data["refresh_token"] = ts.RefreshToken
+	data["last_refresh"] = ts.LastRefresh
+	data["email"] = ts.Email
+	data["account_uuid"] = ts.AccountUUID
+	data["organization_uuid"] = ts.OrganizationUUID
+	data["type"] = ts.Type
+	data["expired"] = ts.Expire
 
 	// Encode and write the token data as JSON
 	if err = json.NewEncoder(f).Encode(data); err != nil {

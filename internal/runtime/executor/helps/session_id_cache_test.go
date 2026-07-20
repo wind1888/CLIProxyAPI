@@ -1,8 +1,10 @@
 package helps
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,11 +19,13 @@ func resetSessionIDCache() {
 }
 
 type fakeClaudeIDKVClient struct {
+	mu            sync.Mutex
 	values        map[string][]byte
 	getErr        error
 	setErr        error
 	expireErr     error
 	setNoPersist  bool
+	expireFalse   bool
 	getCount      int
 	setCount      int
 	expireCount   int
@@ -34,6 +38,8 @@ func newFakeClaudeIDKVClient() *fakeClaudeIDKVClient {
 }
 
 func (c *fakeClaudeIDKVClient) KVGet(_ context.Context, key string) ([]byte, bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.getCount++
 	if c.getErr != nil {
 		return nil, false, c.getErr
@@ -46,6 +52,8 @@ func (c *fakeClaudeIDKVClient) KVGet(_ context.Context, key string) ([]byte, boo
 }
 
 func (c *fakeClaudeIDKVClient) KVSet(_ context.Context, key string, value []byte, opts homekv.KVSetOptions) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.setCount++
 	if opts.EX > 0 {
 		c.lastSetTTL = opts.EX
@@ -62,6 +70,8 @@ func (c *fakeClaudeIDKVClient) KVSet(_ context.Context, key string, value []byte
 }
 
 func (c *fakeClaudeIDKVClient) KVSetNX(_ context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.setCount++
 	c.lastSetTTL = ttl
 	if c.setErr != nil {
@@ -76,11 +86,34 @@ func (c *fakeClaudeIDKVClient) KVSetNX(_ context.Context, key string, value []by
 	return true, nil
 }
 
+func (c *fakeClaudeIDKVClient) KVCompareAndSwap(_ context.Context, key string, expected []byte, expectedExists bool, value []byte, ttl time.Duration) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.setCount++
+	c.lastSetTTL = ttl
+	if c.setErr != nil {
+		return false, c.setErr
+	}
+	current, exists := c.values[key]
+	if exists != expectedExists || (expectedExists && !bytes.Equal(current, expected)) {
+		return false, nil
+	}
+	if !c.setNoPersist {
+		c.values[key] = append([]byte(nil), value...)
+	}
+	return true, nil
+}
+
 func (c *fakeClaudeIDKVClient) KVExpire(_ context.Context, _ string, ttl time.Duration) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.expireCount++
 	c.lastExpireTTL = ttl
 	if c.expireErr != nil {
 		return false, c.expireErr
+	}
+	if c.expireFalse {
+		return false, nil
 	}
 	return true, nil
 }
@@ -219,5 +252,55 @@ func TestCachedSessionIDRequiredNonHomeModeUsesLocalMap(t *testing.T) {
 	}
 	if client.getCount != 0 || client.setCount != 0 || client.expireCount != 0 {
 		t.Fatalf("KV calls = get %d set %d expire %d, want all zero", client.getCount, client.setCount, client.expireCount)
+	}
+}
+
+func TestCachedSessionIDRequiredHomeConcurrentInvalidRepairConverges(t *testing.T) {
+	resetSessionIDCache()
+	client := newFakeClaudeIDKVClient()
+	key := claudeSessionIDKVKey("api-key-concurrent-repair")
+	client.values[key] = []byte("invalid-session-id")
+	useFakeClaudeIDKVClient(t, client, true, nil)
+
+	const workers = 32
+	results := make(chan string, workers)
+	errorsFound := make(chan error, workers)
+	var waitGroup sync.WaitGroup
+	for range workers {
+		waitGroup.Add(1)
+		go func() {
+			defer waitGroup.Done()
+			value, errValue := CachedSessionIDRequired(context.Background(), "api-key-concurrent-repair")
+			if errValue != nil {
+				errorsFound <- errValue
+				return
+			}
+			results <- value
+		}()
+	}
+	waitGroup.Wait()
+	close(results)
+	close(errorsFound)
+
+	for errValue := range errorsFound {
+		t.Errorf("CachedSessionIDRequired() error = %v", errValue)
+	}
+	var expected string
+	for value := range results {
+		if expected == "" {
+			expected = value
+		}
+		if value != expected {
+			t.Errorf("concurrent session ID = %q, want %q", value, expected)
+		}
+	}
+	if !IsValidClaudeCodeUUID(expected) {
+		t.Fatalf("concurrent replacement = %q, want canonical UUIDv4", expected)
+	}
+	client.mu.Lock()
+	stored := string(client.values[key])
+	client.mu.Unlock()
+	if stored != expected {
+		t.Fatalf("stored session ID = %q, want %q", stored, expected)
 	}
 }

@@ -2028,12 +2028,24 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 
 		// Create token storage
 		tokenStorage := anthropicAuth.CreateTokenStorage(bundle)
+		fileName, errFileName := tokenStorage.TokenFileName()
+		if errFileName != nil {
+			log.Errorf("Failed to identify Claude authentication file: %v", errFileName)
+			SetOAuthSessionError(state, "Failed to identify authentication tokens")
+			return
+		}
 		record := &coreauth.Auth{
-			ID:       fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+			ID:       fileName,
 			Provider: "claude",
-			FileName: fmt.Sprintf("claude-%s.json", tokenStorage.Email),
+			FileName: fileName,
 			Storage:  tokenStorage,
-			Metadata: map[string]any{"email": tokenStorage.Email},
+			Metadata: map[string]any{
+				"email":             tokenStorage.Email,
+				"account_uuid":      tokenStorage.AccountUUID,
+				"organization_uuid": tokenStorage.OrganizationUUID,
+				"auth_kind":         "oauth",
+			},
+			Attributes: map[string]string{"auth_kind": "oauth"},
 		}
 		if errGuard := guardOAuthSessionPendingForSave(state, "anthropic"); errGuard != nil {
 			return

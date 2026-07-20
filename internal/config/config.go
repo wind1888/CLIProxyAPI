@@ -489,9 +489,9 @@ type ClaudeKey struct {
 	// Cloak configures request cloaking for non-Claude-Code clients.
 	Cloak *CloakConfig `yaml:"cloak,omitempty" json:"cloak,omitempty"`
 
-	// ExperimentalCCHSigning enables opt-in final-body cch signing for cloaked
-	// Claude /v1/messages requests. It is disabled by default so upstream seed
-	// changes do not alter the proxy's legacy behavior.
+	// ExperimentalCCHSigning is deprecated and retained only for configuration
+	// compatibility. CCH follows Claude Code's first-party host and calibrated
+	// version gate automatically.
 	ExperimentalCCHSigning bool `yaml:"experimental-cch-signing,omitempty" json:"experimental-cch-signing,omitempty"`
 }
 

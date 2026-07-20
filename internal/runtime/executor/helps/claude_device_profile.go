@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	defaultClaudeFingerprintUserAgent      = "claude-cli/2.1.215 (external, cli)"
+	defaultClaudeFingerprintUserAgent      = ClaudeCodeOAuthUserAgent
 	defaultClaudeFingerprintPackageVersion = "0.94.0"
 	defaultClaudeFingerprintRuntimeVersion = "v26.3.0"
 	defaultClaudeFingerprintOS             = "MacOS"
@@ -268,10 +268,37 @@ func claudeDeviceProfileScopeKey(auth *cliproxyauth.Auth, apiKey string) string 
 	switch {
 	case auth != nil && strings.TrimSpace(auth.ID) != "":
 		return "auth:" + strings.TrimSpace(auth.ID)
+	case isClaudeOAuthDeviceProfileAuth(auth):
+		// OAuth access tokens rotate. Header/device learning belongs to the CPA
+		// installation and must not reset merely because a token was refreshed.
+		return "oauth-installation:claude-code-sdk-cli-v1"
 	case strings.TrimSpace(apiKey) != "":
 		return "api_key:" + strings.TrimSpace(apiKey)
 	default:
 		return "global"
+	}
+}
+
+func isClaudeOAuthDeviceProfileAuth(auth *cliproxyauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Attributes != nil {
+		if strings.EqualFold(strings.TrimSpace(auth.Attributes["auth_kind"]), "oauth") || strings.TrimSpace(auth.Attributes["access_token"]) != "" {
+			return true
+		}
+	}
+	return auth.Metadata != nil && (strings.EqualFold(strings.TrimSpace(metadataStringValue(auth.Metadata["auth_kind"])), "oauth") || strings.TrimSpace(metadataStringValue(auth.Metadata["access_token"])) != "")
+}
+
+func metadataStringValue(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case []byte:
+		return string(typed)
+	default:
+		return ""
 	}
 }
 
@@ -534,7 +561,7 @@ func DefaultClaudeVersion(cfg *config.Config) string {
 	if version, ok := parseClaudeCLIVersion(profile.UserAgent); ok {
 		return strconv.Itoa(version.major) + "." + strconv.Itoa(version.minor) + "." + strconv.Itoa(version.patch)
 	}
-	return "2.1.215"
+	return ClaudeCodeOAuthVersion
 }
 
 func ApplyClaudeLegacyDeviceHeaders(r *http.Request, ginHeaders http.Header, cfg *config.Config) {

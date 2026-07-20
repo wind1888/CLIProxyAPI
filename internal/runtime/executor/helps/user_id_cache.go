@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -21,11 +24,15 @@ var (
 	userIDCache            = make(map[string]userIDCacheEntry)
 	userIDCacheMu          sync.RWMutex
 	userIDCacheCleanupOnce sync.Once
+	installationDeviceMu   sync.Mutex
 )
 
 const (
-	userIDTTL                = time.Hour
-	userIDCacheCleanupPeriod = 15 * time.Minute
+	// Claude Code persists .claude.json.userID for the lifetime of an
+	// installation. A long renewable horizon models that persistence while
+	// retaining bounded cleanup for abandoned proxy installations.
+	userIDTTL                = 10 * 365 * 24 * time.Hour
+	userIDCacheCleanupPeriod = 24 * time.Hour
 )
 
 func startUserIDCacheCleanup() {
@@ -59,7 +66,8 @@ func CachedUserID(apiKey string) string {
 	if errValue == nil && value != "" {
 		return value
 	}
-	return generateFakeUserID()
+	value, _ = generateFakeUserIDRequired()
+	return value
 }
 
 // CachedUserIDRequired returns Claude Code's metadata.user_id string using a
@@ -73,52 +81,28 @@ func CachedUserIDRequired(ctx context.Context, apiKey string) (string, error) {
 	if errDeviceID != nil {
 		return "", errDeviceID
 	}
-	return buildClaudeCodeUserID(deviceID, "", sessionID), nil
+	return buildClaudeCodeUserIDRequired(deviceID, "", sessionID)
 }
 
 // CachedClaudeCodeDeviceIDRequired returns a stable Claude Code device_id per apiKey.
 func CachedClaudeCodeDeviceIDRequired(ctx context.Context, apiKey string) (string, error) {
 	if apiKey == "" {
-		return generateClaudeCodeDeviceID(), nil
+		return generateClaudeCodeDeviceIDRequired()
 	}
 	client, homeMode, errClient := currentClaudeIDKVClient()
 	if homeMode {
 		if errClient != nil {
 			return "", errClient
 		}
-		key := claudeUserIDKVKey(apiKey)
-		raw, found, errGet := client.KVGet(ctx, key)
-		if errGet != nil {
-			return "", errGet
-		}
-		if found && isValidClaudeCodeDeviceID(strings.TrimSpace(string(raw))) {
-			if _, errExpire := client.KVExpire(ctx, key, userIDTTL); errExpire != nil {
-				return "", errExpire
-			}
-			return strings.TrimSpace(string(raw)), nil
-		}
-		newDeviceID := generateClaudeCodeDeviceID()
-		if found {
-			written, errSet := client.KVSet(ctx, key, []byte(newDeviceID), homekv.KVSetOptions{EX: userIDTTL})
-			if errSet != nil {
-				return "", errSet
-			}
-			if !written {
-				return "", fmt.Errorf("home kv Claude device id missing after invalid value replacement")
-			}
-			return newDeviceID, nil
-		}
-		if _, errSet := client.KVSetNX(ctx, key, []byte(newDeviceID), userIDTTL); errSet != nil {
-			return "", errSet
-		}
-		raw, found, errGet = client.KVGet(ctx, key)
-		if errGet != nil {
-			return "", errGet
-		}
-		if found && isValidClaudeCodeDeviceID(strings.TrimSpace(string(raw))) {
-			return strings.TrimSpace(string(raw)), nil
-		}
-		return "", fmt.Errorf("home kv Claude device id missing after set")
+		return resolveCachedClaudeIDKVValue(
+			ctx,
+			client,
+			claudeUserIDKVKey(apiKey),
+			userIDTTL,
+			"device ID",
+			isValidClaudeCodeDeviceID,
+			generateClaudeCodeDeviceIDRequired,
+		)
 	}
 
 	userIDCacheCleanupOnce.Do(startUserIDCacheCleanup)
@@ -142,7 +126,10 @@ func CachedClaudeCodeDeviceIDRequired(ctx context.Context, apiKey string) (strin
 		userIDCacheMu.Unlock()
 	}
 
-	newDeviceID := generateClaudeCodeDeviceID()
+	newDeviceID, errNewDeviceID := generateClaudeCodeDeviceIDRequired()
+	if errNewDeviceID != nil {
+		return "", errNewDeviceID
+	}
 
 	userIDCacheMu.Lock()
 	entry, ok = userIDCache[key]
@@ -153,6 +140,78 @@ func CachedClaudeCodeDeviceIDRequired(ctx context.Context, apiKey string) (strin
 	userIDCache[key] = entry
 	userIDCacheMu.Unlock()
 	return entry.value, nil
+}
+
+// CachedClaudeCodeInstallationDeviceIDRequired persists the synthetic SDK
+// device identity in the configured auth directory when Home KV is not active.
+func CachedClaudeCodeInstallationDeviceIDRequired(ctx context.Context, identityScope, authDir string) (string, error) {
+	client, homeMode, errClient := currentClaudeIDKVClient()
+	if homeMode {
+		if errClient != nil {
+			return "", errClient
+		}
+		return resolveCachedClaudeIDKVValue(
+			ctx,
+			client,
+			claudeUserIDKVKey(identityScope),
+			userIDTTL,
+			"device ID",
+			isValidClaudeCodeDeviceID,
+			generateClaudeCodeDeviceIDRequired,
+		)
+	}
+	authDir = strings.TrimSpace(authDir)
+	if authDir == "" {
+		return CachedClaudeCodeDeviceIDRequired(ctx, identityScope)
+	}
+
+	installationDeviceMu.Lock()
+	defer installationDeviceMu.Unlock()
+	if errMkdir := os.MkdirAll(authDir, 0o700); errMkdir != nil {
+		return "", fmt.Errorf("create Claude identity directory: %w", errMkdir)
+	}
+	path := filepath.Join(authDir, ".claude-device-id")
+	if value, errRead := readClaudeInstallationDeviceID(path); errRead == nil {
+		return value, nil
+	} else if !errors.Is(errRead, os.ErrNotExist) {
+		return "", errRead
+	}
+
+	deviceID, errGenerate := generateClaudeCodeDeviceIDRequired()
+	if errGenerate != nil {
+		return "", errGenerate
+	}
+	file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(errOpen, os.ErrExist) {
+		return readClaudeInstallationDeviceID(path)
+	}
+	if errOpen != nil {
+		return "", fmt.Errorf("create Claude installation device ID: %w", errOpen)
+	}
+	if _, errWrite := file.WriteString(deviceID + "\n"); errWrite != nil {
+		_ = file.Close()
+		return "", fmt.Errorf("write Claude installation device ID: %w", errWrite)
+	}
+	if errSync := file.Sync(); errSync != nil {
+		_ = file.Close()
+		return "", fmt.Errorf("sync Claude installation device ID: %w", errSync)
+	}
+	if errClose := file.Close(); errClose != nil {
+		return "", fmt.Errorf("close Claude installation device ID: %w", errClose)
+	}
+	return deviceID, nil
+}
+
+func readClaudeInstallationDeviceID(path string) (string, error) {
+	raw, errRead := os.ReadFile(path)
+	if errRead != nil {
+		return "", errRead
+	}
+	deviceID := strings.TrimSpace(string(raw))
+	if !isValidClaudeCodeDeviceID(deviceID) {
+		return "", fmt.Errorf("invalid Claude installation device ID file")
+	}
+	return deviceID, nil
 }
 
 func claudeUserIDKVKey(apiKey string) string {

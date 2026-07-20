@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -17,7 +16,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
-	xxHash64 "github.com/pierrec/xxHash/xxHash64"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
@@ -148,7 +146,7 @@ func TestApplyClaudeHeaders_DefaultsDangerousDirectBrowserAccessForAPIKey(t *tes
 	}
 }
 
-func TestApplyClaudeHeaders_OmitsDangerousDirectBrowserAccessForOAuth(t *testing.T) {
+func TestApplyClaudeHeaders_SendsDangerousDirectBrowserAccessForOAuth(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 
 	req := newClaudeHeaderTestRequest(t, nil)
@@ -162,8 +160,8 @@ func TestApplyClaudeHeaders_OmitsDangerousDirectBrowserAccessForOAuth(t *testing
 		t.Fatalf("applyClaudeHeaders() error = %v", err)
 	}
 
-	if got := req.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "" {
-		t.Fatalf("Anthropic-Dangerous-Direct-Browser-Access = %q, want empty", got)
+	if got := req.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "true" {
+		t.Fatalf("Anthropic-Dangerous-Direct-Browser-Access = %q, want true", got)
 	}
 }
 
@@ -1455,6 +1453,9 @@ func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
 			Payload: modelPayload,
 		}, cliproxyexecutor.Options{
 			SourceFormat: sdktranslator.FromString("claude"),
+			Metadata: map[string]any{
+				cliproxyexecutor.ExecutionSessionMetadataKey: "cached-user-id-across-models",
+			},
 		}); err != nil {
 			t.Fatalf("Execute(%s) error: %v", model, err)
 		}
@@ -1502,6 +1503,9 @@ func TestClaudeExecutor_ReusesUserIDByDefault(t *testing.T) {
 			Payload: payload,
 		}, cliproxyexecutor.Options{
 			SourceFormat: sdktranslator.FromString("claude"),
+			Metadata: map[string]any{
+				cliproxyexecutor.ExecutionSessionMetadataKey: "cached-user-id-default",
+			},
 		}); err != nil {
 			t.Fatalf("Execute call %d error: %v", i, err)
 		}
@@ -1563,6 +1567,435 @@ func TestClaudeExecutor_GeneratesNewUserIDWhenCacheDisabled(t *testing.T) {
 	}
 	assertClaudeCodeMetadataUserID(t, userIDs[0])
 	assertClaudeCodeMetadataUserID(t, userIDs[1])
+}
+
+func TestAggregateClaudeMessageStreamRestoresAndAccumulatesAllDeltaTypes(t *testing.T) {
+	upstream := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_stream","type":"message","role":"assistant","content":[],"model":"upstream-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":11,"output_tokens":0,"cache_read_input_tokens":3}}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"","citations":null}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello "}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"citations_delta","citation":{"type":"web_search_result_location","url":"https://example.com","title":"Example","cited_text":"world"}}}`,
+		`data: {"type":"content_block_stop","index":0}`,
+		``,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"thinking","thinking":"","signature":""}}`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"reason "}}`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"carefully"}}`,
+		`data: {"type":"content_block_delta","index":1,"delta":{"type":"signature_delta","signature":"sig-final"}}`,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+		`data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}`,
+		`data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}`,
+		`data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"pwd\"}"}}`,
+		`data: {"type":"content_block_stop","index":2}`,
+		``,
+		`data: {"type":"content_block_start","index":3,"content_block":{"type":"server_tool_use","id":"srv_1","name":"web_search","caller":{"type":"direct"},"input":{}}}`,
+		`data: {"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"sdk\"}"}}`,
+		`data: {"type":"content_block_stop","index":3}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":9,"cache_creation_input_tokens":2,"server_tool_use":{"web_search_requests":1}}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	executor := &ClaudeExecutor{upstreamModelNormalizer: func(model string) string { return "upstream-model" }}
+	message, restored, err := aggregateClaudeMessageStream([]byte(upstream), func(line []byte) []byte {
+		line = restoreClaudeOAuthToolNamesFromStreamLine(line, "", false, map[string]string{"Bash": "bash"})
+		return executor.restoreResponseModel(line, "claude-sonnet-4-6")
+	})
+	if err != nil {
+		t.Fatalf("aggregateClaudeMessageStream() error = %v", err)
+	}
+
+	assertions := map[string]string{
+		"id":                        "msg_stream",
+		"type":                      "message",
+		"role":                      "assistant",
+		"model":                     "claude-sonnet-4-6",
+		"stop_reason":               "tool_use",
+		"content.0.text":            "hello world",
+		"content.0.citations.0.url": "https://example.com",
+		"content.1.thinking":        "reason carefully",
+		"content.1.signature":       "sig-final",
+		"content.2.name":            "bash",
+		"content.2.input.command":   "pwd",
+		"content.3.input.query":     "sdk",
+	}
+	for path, want := range assertions {
+		if got := gjson.GetBytes(message, path).String(); got != want {
+			t.Errorf("Message %s = %q, want %q; message=%s", path, got, want, message)
+		}
+	}
+	if got := gjson.GetBytes(message, "usage.input_tokens").Int(); got != 11 {
+		t.Errorf("usage.input_tokens = %d, want 11", got)
+	}
+	if got := gjson.GetBytes(message, "usage.output_tokens").Int(); got != 9 {
+		t.Errorf("usage.output_tokens = %d, want 9", got)
+	}
+	if got := gjson.GetBytes(message, "usage.server_tool_use.web_search_requests").Int(); got != 1 {
+		t.Errorf("usage.server_tool_use.web_search_requests = %d, want 1", got)
+	}
+	if !bytes.Contains(restored, []byte(`"model":"claude-sonnet-4-6"`)) {
+		t.Fatalf("restored SSE did not restore model: %s", restored)
+	}
+	if !bytes.Contains(restored, []byte(`"name":"bash"`)) {
+		t.Fatalf("restored SSE did not restore OAuth tool name: %s", restored)
+	}
+}
+
+func TestAggregateClaudeMessageStreamRejectsErrorsAndInvalidOrdering(t *testing.T) {
+	start := `data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":0}}}`
+	delta := `data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}`
+	stop := `data: {"type":"message_stop"}`
+	textStart := `data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"","citations":null}}`
+	toolStart := `data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}`
+
+	tests := []struct {
+		name       string
+		stream     string
+		wantSubstr string
+	}{
+		{name: "empty", stream: "", wantSubstr: "empty stream response"},
+		{name: "malformed json", stream: `data: {`, wantSubstr: "malformed stream event"},
+		{name: "upstream error", stream: `data: {"type":"error","error":{"type":"overloaded_error","message":"busy"}}`, wantSubstr: "busy"},
+		{name: "delta before start", stream: textStart, wantSubstr: "before message_start"},
+		{name: "event label mismatch", stream: "event: message_stop\n" + start, wantSubstr: "does not match"},
+		{name: "duplicate start", stream: strings.Join([]string{start, start}, "\n"), wantSubstr: "before the previous message_stop"},
+		{name: "out of order index", stream: strings.Join([]string{start, strings.Replace(textStart, `"index":0`, `"index":1`, 1)}, "\n"), wantSubstr: "out of order"},
+		{name: "delta wrong block type", stream: strings.Join([]string{start, textStart, `data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"x"}}`}, "\n"), wantSubstr: "targets text block"},
+		{name: "delta wrong index", stream: strings.Join([]string{start, textStart, `data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"x"}}`}, "\n"), wantSubstr: "has no active content block"},
+		{name: "message delta before block stop", stream: strings.Join([]string{start, textStart, delta}, "\n"), wantSubstr: "before content_block_stop"},
+		{name: "invalid tool json", stream: strings.Join([]string{start, toolStart, `data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{"}}`, `data: {"type":"content_block_stop","index":0}`}, "\n"), wantSubstr: "invalid JSON"},
+		{name: "stop before delta", stream: strings.Join([]string{start, stop}, "\n"), wantSubstr: "before message_delta"},
+		{name: "missing stop", stream: strings.Join([]string{start, delta}, "\n"), wantSubstr: "before message_stop"},
+		{name: "event after stop", stream: strings.Join([]string{start, delta, stop, delta}, "\n"), wantSubstr: "after message_stop"},
+		{name: "unknown event", stream: strings.Join([]string{start, `data: {"type":"future_event"}`}, "\n"), wantSubstr: "unknown stream event"},
+		{name: "done sentinel", stream: `data: [DONE]`, wantSubstr: "non-Anthropic"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, _, err := aggregateClaudeMessageStream([]byte(test.stream), nil)
+			if err == nil {
+				t.Fatal("aggregateClaudeMessageStream() error = nil")
+			}
+			assertStatusErr(t, err, http.StatusBadGateway)
+			if !strings.Contains(err.Error(), test.wantSubstr) {
+				t.Fatalf("error = %q, want substring %q", err, test.wantSubstr)
+			}
+		})
+	}
+}
+
+func TestClaudeExecutorExecuteSyntheticFirstPartyOAuthForcesStreamAndAggregatesMessage(t *testing.T) {
+	var upstreamBody []byte
+	var upstreamHeaders http.Header
+	sse := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"msg_oauth","type":"message","role":"assistant","content":[],"model":"claude-sonnet-4-6","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":4,"output_tokens":0}}}`,
+		``,
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}}`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"pwd\"}"}}`,
+		`data: {"type":"content_block_stop","index":0}`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":3}}`,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if got := req.URL.String(); got != "https://api.anthropic.com/v1/messages?beta=true" {
+			t.Fatalf("upstream URL = %q", got)
+		}
+		body, errRead := io.ReadAll(req.Body)
+		if errRead != nil {
+			t.Fatalf("read upstream body: %v", errRead)
+		}
+		upstreamBody = bytes.Clone(body)
+		upstreamHeaders = req.Header.Clone()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sse)),
+			Request:    req,
+		}, nil
+	}))
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Provider: "claude", Metadata: map[string]any{
+		"access_token": "sk-ant-oat-test",
+		"auth_kind":    "oauth",
+	}}
+	payload := []byte(`{"model":"claude-sonnet-4-6","max_tokens":256,"stream":false,"tools":[{"name":"bash","description":"run","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"Please run pwd and report."}]}`)
+	response, errExecute := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Headers:      http.Header{"User-Agent": {"third-party-client/1.0"}},
+		Metadata: map[string]any{
+			cliproxyexecutor.ExecutionSessionMetadataKey: "synthetic-oauth-stream-test",
+		},
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+
+	if !gjson.GetBytes(upstreamBody, "stream").Bool() {
+		t.Fatalf("synthetic first-party OAuth upstream stream = false; body=%s", upstreamBody)
+	}
+	if got := gjson.GetBytes(upstreamBody, "tools.0.name").String(); got != "Bash" {
+		t.Fatalf("upstream tool name = %q, want Bash", got)
+	}
+	if got := claudeCCHFromBody(t, upstreamBody); got == "00000" {
+		t.Fatalf("first-party OAuth cch was not signed: %s", upstreamBody)
+	}
+	if got := upstreamHeaders.Get("User-Agent"); got != helps.OfficialClaudeCodeOAuthProfile().UserAgent {
+		t.Fatalf("upstream User-Agent = %q", got)
+	}
+	if got := response.Headers.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("response Content-Type = %q, want application/json", got)
+	}
+	if got := gjson.GetBytes(response.Payload, "type").String(); got != "message" {
+		t.Fatalf("response type = %q, want message; payload=%s", got, response.Payload)
+	}
+	if got := gjson.GetBytes(response.Payload, "content.0.name").String(); got != "bash" {
+		t.Fatalf("response tool name = %q, want restored bash; payload=%s", got, response.Payload)
+	}
+	if got := gjson.GetBytes(response.Payload, "content.0.input.command").String(); got != "pwd" {
+		t.Fatalf("response tool input = %q, want pwd; payload=%s", got, response.Payload)
+	}
+	if got := gjson.GetBytes(response.Payload, "usage.output_tokens").Int(); got != 3 {
+		t.Fatalf("response output_tokens = %d, want 3", got)
+	}
+}
+
+func TestClaudeExecutorRealClaudeCodePreservesValidCCH(t *testing.T) {
+	unsigned := []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hello"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.215.d68; cc_entrypoint=cli; cch=00000;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}],"max_tokens":32,"stream":false}`)
+	signed := mustSignAnthropicMessagesBody(t, unsigned)
+	wantBilling := gjson.GetBytes(signed, "system.0.text").String()
+
+	var upstreamBody []byte
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, errRead := io.ReadAll(req.Body)
+		if errRead != nil {
+			t.Fatalf("read upstream body: %v", errRead)
+		}
+		upstreamBody = bytes.Clone(body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(
+				`{"id":"msg_real","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`,
+			)),
+			Request: req,
+		}, nil
+	}))
+
+	auth := &cliproxyauth.Auth{Provider: "claude", Metadata: map[string]any{
+		"access_token": "sk-ant-oat-test",
+		"auth_kind":    "oauth",
+	}}
+	_, errExecute := NewClaudeExecutor(&config.Config{}).Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: signed,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Headers:      http.Header{"User-Agent": {"claude-cli/2.1.215 (external, cli)"}},
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if got := gjson.GetBytes(upstreamBody, "system.0.text").String(); got != wantBilling {
+		t.Fatalf("real Claude Code billing block changed:\n got: %q\nwant: %q", got, wantBilling)
+	}
+	if resigned := mustSignAnthropicMessagesBody(t, upstreamBody); !bytes.Equal(resigned, upstreamBody) {
+		t.Fatalf("real Claude Code cch became stale in passthrough\nbody:     %s\nresigned: %s", upstreamBody, resigned)
+	}
+}
+
+func TestClaudeExecutorExecuteDoesNotForceSyntheticStreamOutsideCloakedFirstPartyOAuth(t *testing.T) {
+	tests := []struct {
+		name    string
+		auth    *cliproxyauth.Auth
+		headers http.Header
+	}{
+		{
+			name:    "api key custom base",
+			auth:    &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123"}},
+			headers: http.Header{"User-Agent": {"third-party-client/1.0"}},
+		},
+		{
+			name:    "real Claude Code OAuth",
+			auth:    &cliproxyauth.Auth{Provider: "claude", Metadata: map[string]any{"access_token": "sk-ant-oat-test", "auth_kind": "oauth"}},
+			headers: http.Header{"User-Agent": {"claude-cli/2.1.215 (external, cli)"}},
+		},
+		{
+			name:    "OAuth cloak disabled",
+			auth:    &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{"cloak_mode": "never"}, Metadata: map[string]any{"access_token": "sk-ant-oat-test", "auth_kind": "oauth"}},
+			headers: http.Header{"User-Agent": {"third-party-client/1.0"}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var upstreamBody []byte
+			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				body, errRead := io.ReadAll(req.Body)
+				if errRead != nil {
+					t.Fatalf("read upstream body: %v", errRead)
+				}
+				upstreamBody = bytes.Clone(body)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": {"application/json"}},
+					Body: io.NopCloser(strings.NewReader(
+						`{"id":"msg_json","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"model":"claude-sonnet-4-6","stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`,
+					)),
+					Request: req,
+				}, nil
+			}))
+
+			auth := test.auth
+			if auth.Attributes != nil && auth.Attributes["api_key"] != "" {
+				serverURL := "https://custom-anthropic.example"
+				auth.Attributes["base_url"] = serverURL
+			}
+			response, errExecute := NewClaudeExecutor(&config.Config{}).Execute(ctx, auth, cliproxyexecutor.Request{
+				Model:   "claude-sonnet-4-6",
+				Payload: []byte(`{"model":"claude-sonnet-4-6","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`),
+			}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), Headers: test.headers})
+			if errExecute != nil {
+				t.Fatalf("Execute() error = %v", errExecute)
+			}
+			if gjson.GetBytes(upstreamBody, "stream").Bool() {
+				t.Fatalf("upstream stream was forced outside synthetic cloaked first-party OAuth: %s", upstreamBody)
+			}
+			if got := gjson.GetBytes(response.Payload, "content.0.text").String(); got != "ok" {
+				t.Fatalf("response text = %q, want ok", got)
+			}
+		})
+	}
+}
+
+func TestClaudeExecutorExecuteStreamForcesFinalUpstreamStreamTrue(t *testing.T) {
+	var upstreamBody []byte
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, errRead := io.ReadAll(req.Body)
+		if errRead != nil {
+			t.Fatalf("read upstream body: %v", errRead)
+		}
+		upstreamBody = bytes.Clone(body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"message_stop\"}\n\n")),
+			Request:    req,
+		}, nil
+	}))
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123", "base_url": "https://custom-anthropic.example"}}
+	result, errExecute := executor.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: []byte(`{"model":"claude-sonnet-4-6","max_tokens":32,"stream":false,"messages":[{"role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+	if !gjson.GetBytes(upstreamBody, "stream").Bool() {
+		t.Fatalf("ExecuteStream upstream stream = false; body=%s", upstreamBody)
+	}
+}
+
+func TestClaudeExecutorExecuteStreamSignsFirstPartyOAuthCCH(t *testing.T) {
+	var upstreamBody []byte
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		body, errRead := io.ReadAll(req.Body)
+		if errRead != nil {
+			t.Fatalf("read upstream body: %v", errRead)
+		}
+		upstreamBody = bytes.Clone(body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: {\"type\":\"message_stop\"}\n\n")),
+			Request:    req,
+		}, nil
+	}))
+
+	auth := &cliproxyauth.Auth{Provider: "claude", Metadata: map[string]any{
+		"access_token": "sk-ant-oat-test",
+		"auth_kind":    "oauth",
+	}}
+	result, errExecute := NewClaudeExecutor(&config.Config{}).ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: []byte(`{"model":"claude-sonnet-4-6","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Headers:      http.Header{"User-Agent": {"third-party-client/1.0"}},
+	})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+	for chunk := range result.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+	if got := claudeCCHFromBody(t, upstreamBody); got == "00000" {
+		t.Fatalf("first-party OAuth streaming cch was not signed: %s", upstreamBody)
+	}
+}
+
+func TestClaudeExecutorCountTokensSignsFirstPartyOAuthCCH(t *testing.T) {
+	var upstreamBody []byte
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if got := req.URL.Path; got != "/v1/messages/count_tokens" {
+			t.Fatalf("upstream path = %q", got)
+		}
+		body, errRead := io.ReadAll(req.Body)
+		if errRead != nil {
+			t.Fatalf("read upstream body: %v", errRead)
+		}
+		upstreamBody = bytes.Clone(body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"input_tokens":7}`)),
+			Request:    req,
+		}, nil
+	}))
+
+	auth := &cliproxyauth.Auth{Provider: "claude", Metadata: map[string]any{
+		"access_token": "sk-ant-oat-test",
+		"auth_kind":    "oauth",
+	}}
+	_, errCount := NewClaudeExecutor(&config.Config{}).CountTokens(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4-6",
+		Payload: []byte(`{"model":"claude-sonnet-4-6","max_tokens":32,"messages":[{"role":"user","content":"hello"}]}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Headers:      http.Header{"User-Agent": {"third-party-client/1.0"}},
+	})
+	if errCount != nil {
+		t.Fatalf("CountTokens() error = %v", errCount)
+	}
+	if got := claudeCCHFromBody(t, upstreamBody); got == "00000" {
+		t.Fatalf("first-party OAuth count_tokens cch was not signed: %s", upstreamBody)
+	}
 }
 
 func TestClaudeExecutor_ExecuteOpenAINonStreamRejectsEmptyClaudeStream(t *testing.T) {
@@ -1843,13 +2276,16 @@ func TestEnsureClaudeCodeCurrentUserCacheControl_SkipsSystemReminders(t *testing
 	}
 }
 
-func TestEnsureClaudeCodeCurrentUserCacheControl_PreservesClientCacheControl(t *testing.T) {
+func TestEnsureClaudeCodeCurrentUserCacheControl_PreservesHistoryAndMarksCurrentPrompt(t *testing.T) {
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"client cached","cache_control":{"type":"ephemeral"}},{"type":"text","text":"Reply only OK"}]}]}`)
 
 	out := ensureClaudeCodeCurrentUserCacheControl(payload)
 
-	if !bytes.Equal(out, payload) {
-		t.Fatalf("payload with existing message cache_control should be unchanged.\noriginal: %s\ngot:      %s", payload, out)
+	if got := gjson.GetBytes(out, "messages.0.content.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("existing cache_control changed: %s", out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.1.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("current user prompt cache_control.type = %q, want ephemeral: %s", got, out)
 	}
 }
 
@@ -2547,8 +2983,8 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	}
 
 	blocks := system.Array()
-	if len(blocks) != 3 {
-		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
+	if len(blocks) != 4 {
+		t.Fatalf("expected 4 system blocks, got %d", len(blocks))
 	}
 
 	if !strings.HasPrefix(blocks[0].Get("text").String(), "x-anthropic-billing-header:") {
@@ -2560,8 +2996,14 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	if !strings.Contains(blocks[2].Get("text").String(), "# Doing tasks") {
 		t.Fatalf("blocks[2] should be full static prompt, got %q", blocks[2].Get("text").String())
 	}
-	if got := gjson.GetBytes(out, "messages.0.content").String(); got != expectedForwardedSystemReminder("You are a helpful assistant.")+"hi" {
-		t.Fatalf("messages[0].content should include forwarded system prompt, got %q", got)
+	if !strings.HasPrefix(blocks[3].Get("text").String(), "# Text output") {
+		t.Fatalf("blocks[3] should be the dynamic prompt block, got %q", blocks[3].Get("text").String())
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != expectedForwardedSystemReminder("You are a helpful assistant.") {
+		t.Fatalf("messages[0].content[0] should contain the forwarded system prompt, got %q", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.1.text").String(); got != "hi" {
+		t.Fatalf("messages[0].content[1] = %q, want hi", got)
 	}
 }
 
@@ -2572,8 +3014,8 @@ func TestCheckSystemInstructionsWithMode_StringSystemStrict(t *testing.T) {
 	out := checkSystemInstructionsWithMode(payload, true)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 3 {
-		t.Fatalf("strict mode should produce 3 injected blocks, got %d", len(blocks))
+	if len(blocks) != 4 {
+		t.Fatalf("strict mode should produce 4 injected blocks, got %d", len(blocks))
 	}
 	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "hi" {
 		t.Fatalf("strict mode should not forward system prompt into messages, got %q", got)
@@ -2587,8 +3029,8 @@ func TestCheckSystemInstructionsWithMode_EmptyStringSystemIgnored(t *testing.T) 
 	out := checkSystemInstructionsWithMode(payload, false)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 3 {
-		t.Fatalf("empty string system should still produce 3 injected blocks, got %d", len(blocks))
+	if len(blocks) != 4 {
+		t.Fatalf("empty string system should still produce 4 injected blocks, got %d", len(blocks))
 	}
 	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "hi" {
 		t.Fatalf("empty string system should not alter messages, got %q", got)
@@ -2602,11 +3044,14 @@ func TestCheckSystemInstructionsWithMode_ArraySystemStillWorks(t *testing.T) {
 	out := checkSystemInstructionsWithMode(payload, false)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 3 {
-		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
+	if len(blocks) != 4 {
+		t.Fatalf("expected 4 system blocks, got %d", len(blocks))
 	}
-	if got := gjson.GetBytes(out, "messages.0.content").String(); got != expectedForwardedSystemReminder("Be concise.")+"hi" {
-		t.Fatalf("messages[0].content should include forwarded array system prompt, got %q", got)
+	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != expectedForwardedSystemReminder("Be concise.") {
+		t.Fatalf("messages[0].content[0] should contain the forwarded system prompt, got %q", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.1.text").String(); got != "hi" {
+		t.Fatalf("messages[0].content[1] = %q, want hi", got)
 	}
 }
 
@@ -2617,11 +3062,14 @@ func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 	out := checkSystemInstructionsWithMode(payload, false)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 3 {
-		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
+	if len(blocks) != 4 {
+		t.Fatalf("expected 4 system blocks, got %d", len(blocks))
 	}
-	if got := gjson.GetBytes(out, "messages.0.content").String(); got != expectedForwardedSystemReminder(`Use <xml> tags & "quotes" in output.`)+"hi" {
+	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != expectedForwardedSystemReminder(`Use <xml> tags & "quotes" in output.`) {
 		t.Fatalf("forwarded system prompt text mangled, got %q", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.1.text").String(); got != "hi" {
+		t.Fatalf("messages[0].content[1] = %q, want hi", got)
 	}
 }
 
@@ -2630,8 +3078,8 @@ func TestCheckSystemInstructionsWithSigningMode_OAuthPreservesClientContent(t *t
 
 	out := checkSystemInstructionsWithSigningMode(payload, false, false, true, "2.1.215", "cli", "")
 
-	if got := len(gjson.GetBytes(out, "system").Array()); got != 3 {
-		t.Fatalf("expected billing, identity, and full static prompt system blocks, got %d", got)
+	if got := len(gjson.GetBytes(out, "system").Array()); got != 4 {
+		t.Fatalf("expected the four official Claude Code system blocks, got %d", got)
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != expectedForwardedSystemReminder("Keep this exact client rule.") {
 		t.Fatalf("client system content was not preserved, got %q", got)
@@ -2644,7 +3092,7 @@ func TestCheckSystemInstructionsWithSigningMode_OAuthPreservesClientContent(t *t
 	}
 }
 
-func TestClaudeExecutor_OAuthDefaultFullCloakPreservesClientContent(t *testing.T) {
+func TestClaudeExecutor_OAuthCustomBaseFullCloakPreservesClientContent(t *testing.T) {
 	var seenBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -2655,10 +3103,10 @@ func TestClaudeExecutor_OAuthDefaultFullCloakPreservesClientContent(t *testing.T
 	defer server.Close()
 
 	executor := NewClaudeExecutor(&config.Config{})
-	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "sk-ant-oat-test",
-		"base_url": server.URL,
-	}}
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "sk-ant-oat-test"},
+	}
 	payload := []byte(`{"system":[{"type":"text","text":"  Keep this exact client rule.  "}],"tools":[{"name":"client_tool","description":"Client tool","input_schema":{"type":"object","properties":{"value":{"type":"string"}}}}],"tool_choice":{"type":"tool","name":"client_tool"},"messages":[{"role":"user","content":[{"type":"text","text":"original user text"}]}]}`)
 
 	_, errExecute := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
@@ -2670,14 +3118,17 @@ func TestClaudeExecutor_OAuthDefaultFullCloakPreservesClientContent(t *testing.T
 	}
 
 	blocks := gjson.GetBytes(seenBody, "system").Array()
-	if len(blocks) != 3 {
-		t.Fatalf("expected billing, identity, and full static prompt system blocks, got %d: %s", len(blocks), gjson.GetBytes(seenBody, "system").Raw)
+	if len(blocks) != 4 {
+		t.Fatalf("expected the four official Claude Code system blocks, got %d: %s", len(blocks), gjson.GetBytes(seenBody, "system").Raw)
 	}
-	if got := blocks[1].Get("text").String(); got != "You are Claude Code, Anthropic's official CLI for Claude." {
+	if got := blocks[1].Get("text").String(); got != "You are a Claude agent, built on Anthropic's Claude Agent SDK." {
 		t.Fatalf("identity block = %q", got)
 	}
 	if !strings.Contains(blocks[2].Get("text").String(), "# Doing tasks") {
 		t.Fatalf("full static prompt missing Doing tasks section: %q", blocks[2].Get("text").String())
+	}
+	if !strings.HasPrefix(blocks[3].Get("text").String(), "# Text output") {
+		t.Fatalf("dynamic prompt missing Text output section: %q", blocks[3].Get("text").String())
 	}
 	if got := gjson.GetBytes(seenBody, "messages.0.content.0.text").String(); got != expectedForwardedSystemReminder("  Keep this exact client rule.  ") {
 		t.Fatalf("client system content was not preserved, got %q", got)
@@ -2698,15 +3149,8 @@ func TestClaudeExecutor_OAuthDefaultFullCloakPreservesClientContent(t *testing.T
 		t.Fatalf("client tool_choice changed, got %q", got)
 	}
 
-	billingPattern := regexp.MustCompile(`(x-anthropic-billing-header:[^"]*?\bcch=)([0-9a-f]{5})(;)`)
-	match := billingPattern.FindSubmatch(seenBody)
-	if match == nil || string(match[2]) == "00000" {
-		t.Fatalf("expected final OAuth body to contain a signed cch: %s", string(seenBody))
-	}
-	unsignedBody := billingPattern.ReplaceAll(seenBody, []byte(`${1}00000${3}`))
-	wantCCH := fmt.Sprintf("%05x", xxHash64.Checksum(unsignedBody, claudeCCHSeed)&0xFFFFF)
-	if got := string(match[2]); got != wantCCH {
-		t.Fatalf("cch = %q, want %q", got, wantCCH)
+	if strings.Contains(blocks[0].Get("text").String(), " cch=") {
+		t.Fatalf("custom base URL should not receive first-party cch: %s", seenBody)
 	}
 }
 
@@ -2720,12 +3164,12 @@ func TestCheckSystemInstructionsWithSigningMode_UsesClaude215UserFingerprint(t *
 	}
 }
 
-func TestCheckSystemInstructionsWithSigningMode_UserFingerprintSkipsSystemReminders(t *testing.T) {
+func TestCheckSystemInstructionsWithSigningMode_UserFingerprintUsesFirstTextIncludingReminder(t *testing.T) {
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>\nAvailable agent types for the Agent tool.\n</system-reminder>"},{"type":"text","text":"<system-reminder>\nCurrent date context.\n</system-reminder>"},{"type":"text","text":"Reply only OK"}]}]}`)
 
 	out := checkSystemInstructionsWithSigningMode(payload, true, false, false, "2.1.215", "sdk-cli", "")
 
-	if got, want := gjson.GetBytes(out, "system.0.text").String(), "x-anthropic-billing-header: cc_version=2.1.215.d68; cc_entrypoint=sdk-cli;"; got != want {
+	if got, want := gjson.GetBytes(out, "system.0.text").String(), "x-anthropic-billing-header: cc_version=2.1.215.52b; cc_entrypoint=sdk-cli;"; got != want {
 		t.Fatalf("billing header = %q, want %q", got, want)
 	}
 }
@@ -2738,8 +3182,8 @@ func TestCheckSystemInstructionsWithSigningMode_SDKCLIIdentityMatchesClaude215(t
 	if got, want := gjson.GetBytes(out, "system.1.text").String(), "You are a Claude agent, built on Anthropic's Claude Agent SDK."; got != want {
 		t.Fatalf("sdk-cli identity = %q, want %q", got, want)
 	}
-	if got := gjson.GetBytes(out, "system.1.cache_control.type").String(); got != "ephemeral" {
-		t.Fatalf("sdk-cli identity cache_control.type = %q, want ephemeral", got)
+	if gjson.GetBytes(out, "system.1.cache_control").Exists() {
+		t.Fatalf("sdk-cli identity should not include cache_control: %s", gjson.GetBytes(out, "system.1").Raw)
 	}
 
 	cliOut := checkSystemInstructionsWithSigningMode(payload, true, false, false, "2.1.215", "cli", "")
@@ -2757,8 +3201,8 @@ func TestCheckSystemInstructionsWithFullSystemPrompt_AddsStaticPromptBlock(t *te
 	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", true)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 3 {
-		t.Fatalf("system block count = %d, want 3: %s", len(blocks), gjson.GetBytes(out, "system").Raw)
+	if len(blocks) != 4 {
+		t.Fatalf("system block count = %d, want 4: %s", len(blocks), gjson.GetBytes(out, "system").Raw)
 	}
 	if got, want := blocks[0].Get("text").String(), "x-anthropic-billing-header: cc_version=2.1.215.d68; cc_entrypoint=sdk-cli;"; got != want {
 		t.Fatalf("billing header = %q, want %q", got, want)
@@ -2766,8 +3210,8 @@ func TestCheckSystemInstructionsWithFullSystemPrompt_AddsStaticPromptBlock(t *te
 	if got, want := blocks[1].Get("text").String(), "You are a Claude agent, built on Anthropic's Claude Agent SDK."; got != want {
 		t.Fatalf("identity block = %q, want %q", got, want)
 	}
-	if got := blocks[1].Get("cache_control.type").String(); got != "ephemeral" {
-		t.Fatalf("identity cache_control.type = %q, want ephemeral", got)
+	if blocks[1].Get("cache_control").Exists() {
+		t.Fatalf("identity must not include cache_control: %s", blocks[1].Raw)
 	}
 	staticPrompt := blocks[2].Get("text").String()
 	for _, want := range []string{
@@ -2777,7 +3221,6 @@ func TestCheckSystemInstructionsWithFullSystemPrompt_AddsStaticPromptBlock(t *te
 		"# Executing actions with care",
 		"# Using your tools",
 		"# Tone and style",
-		"# Text output",
 	} {
 		if !strings.Contains(staticPrompt, want) {
 			t.Fatalf("static prompt missing %q: %q", want, staticPrompt)
@@ -2785,6 +3228,12 @@ func TestCheckSystemInstructionsWithFullSystemPrompt_AddsStaticPromptBlock(t *te
 	}
 	if got := blocks[2].Get("cache_control.type").String(); got != "ephemeral" {
 		t.Fatalf("static prompt cache_control.type = %q, want ephemeral", got)
+	}
+	if strings.Contains(staticPrompt, "# Text output") {
+		t.Fatalf("system[2] must end before Text output: %q", staticPrompt)
+	}
+	if got := blocks[3].Get("text").String(); got != helps.ClaudeCodeTextOutput {
+		t.Fatalf("system[3] dynamic prompt = %q", got)
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != expectedForwardedSystemReminder("Client rule") {
 		t.Fatalf("client system content was not preserved, got %q", got)
@@ -2800,8 +3249,8 @@ func TestCheckSystemInstructionsWithFullSystemPrompt_DedupesFullClientStaticProm
 
 	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", true)
 
-	if got := len(gjson.GetBytes(out, "system").Array()); got != 3 {
-		t.Fatalf("system block count = %d, want 3: %s", got, gjson.GetBytes(out, "system").Raw)
+	if got := len(gjson.GetBytes(out, "system").Array()); got != 4 {
+		t.Fatalf("system block count = %d, want 4: %s", got, gjson.GetBytes(out, "system").Raw)
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.#").Int(); got != 1 {
 		t.Fatalf("messages.0.content count = %d, want 1: %s", got, gjson.GetBytes(out, "messages.0.content").Raw)
@@ -2824,7 +3273,7 @@ func TestCheckSystemInstructionsWithFullSystemPrompt_DedupesStaticSectionsAndKee
 	}
 	for _, duplicate := range []string{"# Doing tasks", "# Using your tools"} {
 		if strings.Contains(forwarded, duplicate) {
-			t.Fatalf("forwarded system reminder still contains duplicate section %q: %q", duplicate, forwarded)
+			t.Fatalf("forwarded system reminder still contains exact duplicate section %q: %q", duplicate, forwarded)
 		}
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.1.text").String(); got != "Reply only OK" {
@@ -2837,14 +3286,17 @@ func TestCheckSystemInstructionsWithFullSystemPrompt_MergesClientDynamicSections
 		"# auto memory\n- Remember client-side preference.\n\n" +
 		"# Environment\nYou have been invoked in the following environment: \n- Primary working directory: /client/project\n- Platform: darwin\n\n" +
 		"# Context management\n- The conversation has unlimited context through automatic summarization."
-	clientSystem := helps.ClaudeCodeStaticSystemPrompt + "\n\n" + dynamicPrompt
+	clientSystem := helps.ClaudeCodeStaticSystemPrompt + "\n\n" + helps.ClaudeCodeTextOutput + "\n\n" + dynamicPrompt
 	payload := []byte(`{"system":[{"type":"text","text":""}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
 	payload, _ = sjson.SetBytes(payload, "system.0.text", clientSystem)
 
 	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", true)
 
-	if got := gjson.GetBytes(out, "system.2.text").String(); got != clientSystem {
-		t.Fatalf("system.2.text did not preserve official static+dynamic prompt:\nGOT:\n%s\nWANT:\n%s", got, clientSystem)
+	if got := gjson.GetBytes(out, "system.2.text").String(); got != helps.ClaudeCodeStaticSystemPrompt {
+		t.Fatalf("system.2.text did not preserve the official static prompt:\nGOT:\n%s", got)
+	}
+	if got, want := gjson.GetBytes(out, "system.3.text").String(), helps.ClaudeCodeTextOutput+"\n\n"+dynamicPrompt; got != want {
+		t.Fatalf("system.3.text did not preserve the official dynamic prompt:\nGOT:\n%s\nWANT:\n%s", got, want)
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.#").Int(); got != 1 {
 		t.Fatalf("dynamic official prompt should not be forwarded as reminder, content count = %d: %s", got, gjson.GetBytes(out, "messages.0.content").Raw)
@@ -2861,9 +3313,9 @@ func TestCheckSystemInstructionsWithFullSystemPrompt_MovesDynamicSectionsAndKeep
 
 	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", true)
 
-	systemPrompt := gjson.GetBytes(out, "system.2.text").String()
+	systemPrompt := gjson.GetBytes(out, "system.3.text").String()
 	if !strings.Contains(systemPrompt, clientDynamic) {
-		t.Fatalf("client dynamic section was not merged into system.2: %q", systemPrompt)
+		t.Fatalf("client dynamic section was not merged into system.3: %q", systemPrompt)
 	}
 	forwarded := gjson.GetBytes(out, "messages.0.content.0.text").String()
 	if !strings.Contains(forwarded, "请始终使用中文回答。") {
@@ -2885,11 +3337,11 @@ func TestCheckSystemInstructionsWithFullSystemPrompt_PreservesClientDynamicSecti
 
 	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", true)
 
-	systemPrompt := gjson.GetBytes(out, "system.2.text").String()
+	systemPrompt := gjson.GetBytes(out, "system.3.text").String()
 	sessionIdx := strings.Index(systemPrompt, "# Session-specific guidance")
 	environmentIdx := strings.Index(systemPrompt, "# Environment")
 	if sessionIdx < 0 || environmentIdx < 0 {
-		t.Fatalf("system.2 missing dynamic sections: %q", systemPrompt)
+		t.Fatalf("system.3 missing dynamic sections: %q", systemPrompt)
 	}
 	if environmentIdx > sessionIdx {
 		t.Fatalf("dynamic sections should preserve client order: environment=%d session=%d", environmentIdx, sessionIdx)
@@ -2996,8 +3448,8 @@ func TestClaudeExecutor_SDKCLIIdentityFollowsClientEntrypoint(t *testing.T) {
 	if got, want := gjson.GetBytes(seenBody, "system.1.text").String(), "You are a Claude agent, built on Anthropic's Claude Agent SDK."; got != want {
 		t.Fatalf("sdk-cli identity = %q, want %q", got, want)
 	}
-	if got := gjson.GetBytes(seenBody, "system.1.cache_control.type").String(); got != "ephemeral" {
-		t.Fatalf("sdk-cli identity cache_control.type = %q, want ephemeral", got)
+	if gjson.GetBytes(seenBody, "system.1.cache_control").Exists() {
+		t.Fatalf("sdk-cli identity must not include cache_control: %s", gjson.GetBytes(seenBody, "system.1").Raw)
 	}
 	if got := seenHeaders.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "true" {
 		t.Fatalf("Anthropic-Dangerous-Direct-Browser-Access = %q, want true", got)
@@ -3018,7 +3470,7 @@ func TestClaudeExecutor_SDKCLIIdentityFollowsClientEntrypoint(t *testing.T) {
 	}
 }
 
-func TestClaudeExecutor_ExperimentalCCHSigningDisabledByDefaultOmitsCCH(t *testing.T) {
+func TestClaudeExecutor_CustomBaseDoesNotEnableCCHByDefault(t *testing.T) {
 	var seenBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -3054,11 +3506,52 @@ func TestClaudeExecutor_ExperimentalCCHSigningDisabledByDefaultOmitsCCH(t *testi
 		t.Fatalf("billing header should use Claude Code 2.1.215, got %q", billingHeader)
 	}
 	if strings.Contains(billingHeader, " cch=") {
-		t.Fatalf("default API key mode should not forward cch, got %q", billingHeader)
+		t.Fatalf("custom base URL should not receive cch by default, got %q", billingHeader)
 	}
 }
 
-func TestClaudeExecutor_ExperimentalCCHSigningOptInSignsFinalBody(t *testing.T) {
+func TestClaudeExecutor_FirstPartyAPIKeySignsCCHByDefault(t *testing.T) {
+	var seenBody []byte
+	ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		if got := req.URL.String(); got != "https://api.anthropic.com/v1/messages?beta=true" {
+			t.Fatalf("upstream URL = %q", got)
+		}
+		body, errRead := io.ReadAll(req.Body)
+		if errRead != nil {
+			t.Fatalf("read upstream body: %v", errRead)
+		}
+		seenBody = bytes.Clone(body)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": {"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"id":"msg_1","type":"message","model":"claude-3-5-sonnet","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`)),
+			Request:    req,
+		}, nil
+	}))
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Provider: "claude", Attributes: map[string]string{"api_key": "key-123"}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	_, errExecute := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("claude"),
+		Headers:      http.Header{"User-Agent": {"third-party-client/1.0"}},
+	})
+	if errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if len(seenBody) == 0 {
+		t.Fatal("expected request body to be captured")
+	}
+	if got := claudeCCHFromBody(t, seenBody); got == "00000" {
+		t.Fatalf("first-party API-key cch was not signed: %s", seenBody)
+	}
+}
+
+func TestClaudeExecutor_DeprecatedCCHFlagDoesNotOverrideCustomBaseGate(t *testing.T) {
 	var seenBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -3096,16 +3589,9 @@ func TestClaudeExecutor_ExperimentalCCHSigningOptInSignsFinalBody(t *testing.T) 
 		t.Fatalf("message text = %q, want %q", got, messageText)
 	}
 
-	billingPattern := regexp.MustCompile(`(x-anthropic-billing-header:[^"]*?\bcch=)([0-9a-f]{5})(;)`)
-	match := billingPattern.FindSubmatch(seenBody)
-	if match == nil {
-		t.Fatalf("expected signed billing header in body: %s", string(seenBody))
-	}
-	actualCCH := string(match[2])
-	unsignedBody := billingPattern.ReplaceAll(seenBody, []byte(`${1}00000${3}`))
-	wantCCH := fmt.Sprintf("%05x", xxHash64.Checksum(unsignedBody, 0x6E52736AC806831E)&0xFFFFF)
-	if actualCCH != wantCCH {
-		t.Fatalf("cch = %q, want %q\nbody: %s", actualCCH, wantCCH, string(seenBody))
+	billingHeader := gjson.GetBytes(seenBody, "system.0.text").String()
+	if strings.Contains(billingHeader, " cch=") {
+		t.Fatalf("deprecated cch flag must not enable signing for a custom base URL: %s", seenBody)
 	}
 }
 
@@ -3225,8 +3711,8 @@ func TestApplyCloaking_PreservesConfiguredStrictModeAndSensitiveWordsWhenModeOmi
 	}
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 3 {
-		t.Fatalf("expected strict mode to keep the 3 injected Claude Code system blocks, got %d", len(blocks))
+	if len(blocks) != 4 {
+		t.Fatalf("expected strict mode to keep the 4 injected Claude Code system blocks, got %d", len(blocks))
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.#").Int(); got != 1 {
 		t.Fatalf("strict mode should not prepend a forwarded system reminder block, got %d content blocks", got)
@@ -3251,8 +3737,8 @@ func TestApplyCloaking_FullSystemPromptDefaultEnabled(t *testing.T) {
 	}
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 3 {
-		t.Fatalf("system block count = %d, want 3: %s", len(blocks), gjson.GetBytes(out, "system").Raw)
+	if len(blocks) != 4 {
+		t.Fatalf("system block count = %d, want 4: %s", len(blocks), gjson.GetBytes(out, "system").Raw)
 	}
 	if !strings.Contains(blocks[2].Get("text").String(), "# Doing tasks") {
 		t.Fatalf("full static prompt missing Doing tasks section: %q", blocks[2].Get("text").String())
@@ -3552,5 +4038,571 @@ func TestEnsureClaudeThinkingDisplay_SkipsWhenThinkingMissing(t *testing.T) {
 
 	if gjson.GetBytes(out, "thinking").Exists() {
 		t.Fatalf("thinking should remain absent: %s", out)
+	}
+}
+
+func TestApplySyntheticClaudeCodeThinkingProfileDefaultsAdaptiveHighOmittedForClaude46(t *testing.T) {
+	payload := []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}],"temperature":0.7,"top_p":0.9,"top_k":40}`)
+	out := prepareClaudeCloakedThinking(payload, "claude-sonnet-4-6", true)
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive: %s", got, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.display").String(); got != "omitted" {
+		t.Fatalf("thinking.display = %q, want omitted: %s", got, out)
+	}
+	if got := gjson.GetBytes(out, "output_config.effort").String(); got != "high" {
+		t.Fatalf("output_config.effort = %q, want high: %s", got, out)
+	}
+	for _, path := range []string{"temperature", "top_p", "top_k"} {
+		if gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("%s survived adaptive profile: %s", path, out)
+		}
+	}
+}
+
+func TestApplySyntheticClaudeCodeThinkingProfilePreservesExplicitValues(t *testing.T) {
+	payload := []byte(`{"thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"low"}}`)
+	out := prepareClaudeCloakedThinking(payload, "claude-opus-4-6", true)
+	if got := gjson.GetBytes(out, "thinking.display").String(); got != "summarized" {
+		t.Fatalf("explicit display = %q, want summarized", got)
+	}
+	if got := gjson.GetBytes(out, "output_config.effort").String(); got != "low" {
+		t.Fatalf("explicit effort = %q, want low", got)
+	}
+}
+
+func TestApplySyntheticClaudeCodeThinkingProfileDemotesForcedToolChoice(t *testing.T) {
+	payload := []byte(`{"tool_choice":{"type":"tool","name":"Bash"}}`)
+	out := prepareClaudeCloakedThinking(payload, "claude-sonnet-4-6", true)
+	if got := gjson.GetBytes(out, "tool_choice.type").String(); got != "auto" {
+		t.Fatalf("tool_choice.type = %q, want auto: %s", got, out)
+	}
+	if got := gjson.GetBytes(out, "thinking.type").String(); got != "adaptive" {
+		t.Fatalf("thinking.type = %q, want adaptive: %s", got, out)
+	}
+}
+
+func TestShouldApplyClaudeCloakingDistinguishesRealClaudeClient(t *testing.T) {
+	if !shouldApplyClaudeCloaking(context.Background(), &config.Config{}, nil) {
+		t.Fatal("third-party request should use the cloak profile")
+	}
+	realHeaders := http.Header{"User-Agent": {"claude-cli/2.1.215 (external, cli)"}}
+	realCtx, _ := resolveClaudeClientContext(context.Background(), realHeaders)
+	if shouldApplyClaudeCloaking(realCtx, &config.Config{}, nil) {
+		t.Fatal("real Claude client should bypass thinking normalization")
+	}
+}
+
+func TestComputeFingerprintUsesJavaScriptUTF16Indexing(t *testing.T) {
+	const message = "abcd😀efghijklmnopqrstuv"
+	if got := computeFingerprint(message, "2.1.215"); got != "35d" {
+		t.Fatalf("computeFingerprint() = %q, want JavaScript reference 35d", got)
+	}
+}
+
+func TestBuildTextBlockUsesJavaScriptCompatibleEscaping(t *testing.T) {
+	block := buildTextBlock(`<system-reminder>one & "two"</system-reminder>`, map[string]string{"type": "ephemeral", "ttl": "1h"})
+	if strings.Contains(block, `\u003c`) || strings.Contains(block, `\u003e`) || strings.Contains(block, `\u0026`) {
+		t.Fatalf("buildTextBlock HTML-escaped injected prompt text: %s", block)
+	}
+	if got := gjson.Get(block, "text").String(); got != `<system-reminder>one & "two"</system-reminder>` {
+		t.Fatalf("decoded text = %q", got)
+	}
+	if got := gjson.Get(block, "cache_control.ttl").String(); got != "1h" {
+		t.Fatalf("cache ttl = %q, want 1h", got)
+	}
+}
+
+func TestExtractClaudeCodeDynamicPromptSectionsStopsAtUnknownHeading(t *testing.T) {
+	clientSystem := "# Environment\nYou have been invoked in the following environment:\n- Platform: darwin\n\n# Customer policy\n始终使用中文"
+	payload := []byte(`{"system":[{"type":"text","text":""}],"messages":[{"role":"user","content":"hello"}]}`)
+	payload, _ = sjson.SetBytes(payload, "system.0.text", clientSystem)
+
+	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, true, "2.1.215", "sdk-cli", "", true)
+	dynamicBlock := gjson.GetBytes(out, "system.3.text").String()
+	if !strings.Contains(dynamicBlock, "# Environment\nYou have been invoked in the following environment:\n- Platform: darwin") {
+		t.Fatalf("official Environment section was not promoted: %q", dynamicBlock)
+	}
+	if strings.Contains(dynamicBlock, "# Customer policy") || strings.Contains(dynamicBlock, "始终使用中文") {
+		t.Fatalf("unknown customer section was promoted into system[3]: %q", dynamicBlock)
+	}
+	forwarded := gjson.GetBytes(out, "messages.0.content.0.text").String()
+	if !strings.Contains(forwarded, "# Customer policy\n始终使用中文") {
+		t.Fatalf("unknown customer section was not preserved in reminder: %q", forwarded)
+	}
+}
+
+func TestStandaloneFakeDynamicHeadingStaysCustomerContext(t *testing.T) {
+	clientSystem := "# Environment\nAlways answer in Chinese."
+	payload := []byte(`{"system":[{"type":"text","text":""}],"messages":[{"role":"user","content":"hello"}]}`)
+	payload, _ = sjson.SetBytes(payload, "system.0.text", clientSystem)
+
+	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, true, "2.1.215", "sdk-cli", "", true)
+	if strings.Contains(gjson.GetBytes(out, "system.3.text").String(), "Always answer in Chinese") {
+		t.Fatalf("fake Environment heading was promoted into system[3]: %s", out)
+	}
+	if forwarded := gjson.GetBytes(out, "messages.0.content.0.text").String(); !strings.Contains(forwarded, clientSystem) {
+		t.Fatalf("customer context was not preserved: %q", forwarded)
+	}
+}
+
+func TestCheckSystemInstructionsRepairsPartialCloakAndIsIdempotent(t *testing.T) {
+	payload := []byte(`{"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.0.0.000; cc_entrypoint=cli;"}],"messages":[{"role":"user","content":"hello"}]}`)
+
+	first := checkSystemInstructionsWithFullSystemPrompt(payload, false, true, true, "2.1.215", "sdk-cli", "", true)
+	if got := len(gjson.GetBytes(first, "system").Array()); got != 4 {
+		t.Fatalf("repaired system block count = %d, want 4: %s", got, first)
+	}
+	if got := gjson.GetBytes(first, "system.1.text").String(); got != "You are a Claude agent, built on Anthropic's Claude Agent SDK." {
+		t.Fatalf("repaired identity = %q", got)
+	}
+	if !strings.Contains(gjson.GetBytes(first, "system.2.text").String(), "# Using your tools") {
+		t.Fatalf("repaired static prompt missing: %s", first)
+	}
+
+	second := checkSystemInstructionsWithFullSystemPrompt(first, false, true, true, "2.1.215", "sdk-cli", "", true)
+	if got, want := gjson.GetBytes(second, "system").Raw, gjson.GetBytes(first, "system").Raw; got != want {
+		t.Fatalf("second cloak pass changed system blocks\nfirst:  %s\nsecond: %s", want, got)
+	}
+}
+
+func TestApplyCloakingOAuthFirstPartyMatchesCapturedCacheProfile(t *testing.T) {
+	const sessionID = "123e4567-e89b-42d3-a456-426614174000"
+	ctx := withClaudeCanonicalSessionID(context.Background(), sessionID)
+	auth := &cliproxyauth.Auth{
+		Provider: "claude",
+		Metadata: map[string]any{"access_token": "sk-ant-oat-test"},
+	}
+	payload := []byte(`{"cache_control":{"type":"ephemeral"},"messages":[{"role":"user","content":"hello"}]}`)
+
+	out, errCloak := applyCloaking(ctx, &config.Config{}, auth, payload, "claude-sonnet-4", "sk-ant-oat-test")
+	if errCloak != nil {
+		t.Fatalf("applyCloaking() error = %v", errCloak)
+	}
+	if billing := gjson.GetBytes(out, "system.0.text").String(); !strings.Contains(billing, " cch=00000;") {
+		t.Fatalf("first-party OAuth cloak must emit a cch placeholder for final-body signing, got %q", billing)
+	}
+	if gjson.GetBytes(out, "system.1.cache_control").Exists() {
+		t.Fatalf("system[1] identity must not carry cache_control: %s", out)
+	}
+	if got := gjson.GetBytes(out, "system.2.cache_control.ttl").String(); got != "1h" {
+		t.Fatalf("system[2] cache ttl = %q, want 1h", got)
+	}
+	if got := gjson.GetBytes(out, "system.2.cache_control.scope").String(); got != "global" {
+		t.Fatalf("system[2] cache scope = %q, want global", got)
+	}
+	if got := gjson.GetBytes(out, "system.3.cache_control.ttl").String(); got != "1h" {
+		t.Fatalf("system[3] cache ttl = %q, want 1h", got)
+	}
+	if gjson.GetBytes(out, "system.3.cache_control.scope").Exists() {
+		t.Fatalf("system[3] must not carry global scope: %s", out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.cache_control.ttl").String(); got != "1h" {
+		t.Fatalf("user cache ttl = %q, want 1h: %s", got, out)
+	}
+	if gjson.GetBytes(out, "cache_control").Exists() {
+		t.Fatalf("top-level automatic cache_control should be removed: %s", out)
+	}
+	userID := gjson.GetBytes(out, "metadata.user_id").String()
+	if got := gjson.Get(userID, "session_id").String(); got != sessionID {
+		t.Fatalf("metadata session = %q, want %q", got, sessionID)
+	}
+}
+
+func TestApplyClaudeHeadersOAuthFirstPartyMatchesCapturedProfile(t *testing.T) {
+	const sessionID = "123e4567-e89b-42d3-a456-426614174000"
+	auth := &cliproxyauth.Auth{
+		Provider: "claude",
+		Metadata: map[string]any{"access_token": "sk-ant-oat-test"},
+	}
+	incoming := http.Header{"User-Agent": []string{"third-party-client/1.0"}}
+	req := newClaudeHeaderTestRequest(t, incoming)
+	req = req.WithContext(withClaudeCanonicalSessionID(req.Context(), sessionID))
+
+	if errHeaders := applyClaudeHeaders(req, auth, "sk-ant-oat-test", false, nil, &config.Config{}, incoming); errHeaders != nil {
+		t.Fatalf("applyClaudeHeaders() error = %v", errHeaders)
+	}
+	profile := helps.OfficialClaudeCodeOAuthProfile()
+	wantBetas := profile.BetaHeader + "," + helps.ClaudeCodeExtendedCacheTTLBeta
+	if got := req.Header.Get("Anthropic-Beta"); got != wantBetas {
+		t.Fatalf("Anthropic-Beta = %q, want %q", got, wantBetas)
+	}
+	if got := req.Header.Get("User-Agent"); got != profile.UserAgent {
+		t.Fatalf("User-Agent = %q, want %q", got, profile.UserAgent)
+	}
+	if got := req.Header.Get(helps.ClaudeCodeDangerousDirectBrowserAccessHeader); got != "true" {
+		t.Fatalf("Dangerous Direct Browser Access = %q, want true", got)
+	}
+	if got := req.Header.Get(helps.ClaudeCodeSessionHeader); got != sessionID {
+		t.Fatalf("session header = %q, want %q", got, sessionID)
+	}
+	if requestID := req.Header.Get("x-client-request-id"); !helps.IsValidClaudeCodeUUID(requestID) {
+		t.Fatalf("x-client-request-id = %q, want UUIDv4", requestID)
+	}
+}
+
+func TestApplyClaudeHeadersSyntheticOAuthMatchesConditionalBetaOrderAndNoStreamHelper(t *testing.T) {
+	auth := &cliproxyauth.Auth{Provider: "claude", Metadata: map[string]any{"access_token": "sk-ant-oat-test"}}
+	req := newClaudeHeaderTestRequest(t, http.Header{"User-Agent": {"third-party/1.0"}})
+	if errHeaders := applyClaudeHeaders(req, auth, "sk-ant-oat-test", true, []string{
+		helps.ClaudeCodeAdvancedToolUseBeta,
+		helps.ClaudeCodeEffortBeta,
+	}, &config.Config{}, nil); errHeaders != nil {
+		t.Fatalf("applyClaudeHeaders() error = %v", errHeaders)
+	}
+	wantBetas := strings.Join([]string{
+		helps.OfficialClaudeCodeOAuthProfile().BetaHeader,
+		helps.ClaudeCodeAdvancedToolUseBeta,
+		helps.ClaudeCodeEffortBeta,
+		helps.ClaudeCodeExtendedCacheTTLBeta,
+	}, ",")
+	if got := req.Header.Get("Anthropic-Beta"); got != wantBetas {
+		t.Fatalf("Anthropic-Beta = %q, want %q", got, wantBetas)
+	}
+	if got := req.Header.Get("X-Stainless-Helper-Method"); got != "" {
+		t.Fatalf("synthetic sdk-cli stream helper = %q, want absent", got)
+	}
+}
+
+func TestApplyClaudeHeadersRealClaudePreservesClientBetasAndOptionalStreamHelper(t *testing.T) {
+	auth := &cliproxyauth.Auth{Provider: "claude", Metadata: map[string]any{"access_token": "sk-ant-oat-test"}}
+	incoming := http.Header{
+		"User-Agent":     {"claude-cli/2.1.215 (external, cli)"},
+		"Anthropic-Beta": {"client-beta-one,client-beta-two"},
+	}
+	req := newClaudeHeaderTestRequest(t, incoming)
+	if errHeaders := applyClaudeHeaders(req, auth, "sk-ant-oat-test", true, nil, &config.Config{}, incoming); errHeaders != nil {
+		t.Fatalf("applyClaudeHeaders() error = %v", errHeaders)
+	}
+	if got := req.Header.Get("Anthropic-Beta"); got != "client-beta-one,client-beta-two" {
+		t.Fatalf("real Claude betas = %q", got)
+	}
+	if got := req.Header.Get("X-Stainless-Helper-Method"); got != "" {
+		t.Fatalf("messages.create stream helper = %q, want absent", got)
+	}
+
+	incoming.Set("X-Stainless-Helper-Method", "stream")
+	req = newClaudeHeaderTestRequest(t, incoming)
+	if errHeaders := applyClaudeHeaders(req, auth, "sk-ant-oat-test", true, nil, &config.Config{}, incoming); errHeaders != nil {
+		t.Fatalf("applyClaudeHeaders() with client helper error = %v", errHeaders)
+	}
+	if got := req.Header.Get("X-Stainless-Helper-Method"); got != "stream" {
+		t.Fatalf("real Claude helper = %q, want preserved stream", got)
+	}
+}
+
+func TestApplyClaudeHeadersHonorsDisabledCloakDecision(t *testing.T) {
+	auth := &cliproxyauth.Auth{Provider: "claude", Metadata: map[string]any{"access_token": "sk-ant-oat-test"}}
+	incoming := http.Header{
+		"User-Agent":                  {"third-party/1.0"},
+		"X-Stainless-Package-Version": {"third-party-sdk/7"},
+		"X-Stainless-Os":              {"ThirdPartyOS"},
+	}
+	req := newClaudeHeaderTestRequest(t, incoming)
+	req = req.WithContext(withClaudeCloakDecision(req.Context(), false))
+	if errHeaders := applyClaudeHeaders(req, auth, "sk-ant-oat-test", false, nil, &config.Config{}, incoming); errHeaders != nil {
+		t.Fatalf("applyClaudeHeaders() error = %v", errHeaders)
+	}
+	if got := req.Header.Get("Anthropic-Beta"); got != "" {
+		t.Fatalf("disabled cloak synthesized betas %q", got)
+	}
+	if got := req.Header.Get("User-Agent"); got != "third-party/1.0" {
+		t.Fatalf("disabled cloak User-Agent = %q, want client value", got)
+	}
+	if got := req.Header.Get("X-Stainless-Package-Version"); got != "third-party-sdk/7" {
+		t.Fatalf("disabled cloak package version = %q, want client value", got)
+	}
+	if got := req.Header.Get("X-Stainless-Os"); got != "ThirdPartyOS" {
+		t.Fatalf("disabled cloak OS = %q, want client value", got)
+	}
+	for _, headerName := range []string{"X-Stainless-Runtime-Version", "X-Stainless-Arch"} {
+		if got := req.Header.Get(headerName); got != "" {
+			t.Fatalf("disabled cloak synthesized %s=%q", headerName, got)
+		}
+	}
+}
+
+func TestEnforceCacheControlLimitCountsTopLevelAutomaticCache(t *testing.T) {
+	payload := []byte(`{
+		"cache_control":{"type":"ephemeral"},
+		"system":[{"type":"text","text":"s1","cache_control":{"type":"ephemeral"}},{"type":"text","text":"s2","cache_control":{"type":"ephemeral"}}],
+		"messages":[{"role":"user","content":[{"type":"text","text":"u1","cache_control":{"type":"ephemeral"}},{"type":"text","text":"u2","cache_control":{"type":"ephemeral"}}]}]
+	}`)
+	if got := countCacheControls(payload); got != 5 {
+		t.Fatalf("countCacheControls() = %d, want 5", got)
+	}
+	out := enforceCacheControlLimit(payload, 4)
+	if gjson.GetBytes(out, "cache_control").Exists() {
+		t.Fatalf("top-level automatic cache should be removed first: %s", out)
+	}
+	if got := countCacheControls(out); got != 4 {
+		t.Fatalf("countCacheControls(out) = %d, want 4", got)
+	}
+}
+
+func TestNormalizeClaudeOAuthCacheControlTTLKeepsOfficialOneHourProfile(t *testing.T) {
+	payload := []byte(`{
+		"tools":[{"name":"tool","cache_control":{"type":"ephemeral"}}],
+		"system":[{"type":"text","text":"identity","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+		"messages":[{"role":"user","content":[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}}]}]
+	}`)
+	out := normalizeClaudeOAuthCacheControlTTL(payload)
+	for _, path := range []string{"tools.0", "system.0", "messages.0.content.0"} {
+		if got := gjson.GetBytes(out, path+".cache_control.ttl").String(); got != "1h" {
+			t.Fatalf("%s cache ttl = %q, want 1h: %s", path, got, out)
+		}
+	}
+}
+
+func TestClaudeExecutorCountTokensProjectsOfficialTokenCountingFields(t *testing.T) {
+	var messagesBody []byte
+	var countBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		switch r.URL.Path {
+		case "/v1/messages":
+			messagesBody = bytes.Clone(body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-sonnet-4","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+		case "/v1/messages/count_tokens":
+			countBody = bytes.Clone(body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"input_tokens":1}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider:   "claude",
+		Attributes: map[string]string{"base_url": server.URL},
+		Metadata:   map[string]any{"access_token": "sk-ant-oat-test"},
+	}
+	req := cliproxyexecutor.Request{
+		Model:   "claude-sonnet-4",
+		Payload: []byte(`{"system":"Keep this client rule.","messages":[{"role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")}
+
+	if _, errExecute := executor.Execute(context.Background(), auth, req, opts); errExecute != nil {
+		t.Fatalf("Execute() error = %v", errExecute)
+	}
+	if _, errCount := executor.CountTokens(context.Background(), auth, req, opts); errCount != nil {
+		t.Fatalf("CountTokens() error = %v", errCount)
+	}
+	if len(messagesBody) == 0 || len(countBody) == 0 {
+		t.Fatalf("missing captured bodies: messages=%d count=%d", len(messagesBody), len(countBody))
+	}
+	for _, field := range []string{"model", "messages", "system", "tools", "tool_choice", "thinking", "output_config", "cache_control"} {
+		if got, want := gjson.GetBytes(countBody, field).Raw, gjson.GetBytes(messagesBody, field).Raw; got != want {
+			t.Fatalf("count_tokens %s differs from messages request\nmessages: %s\ncount:    %s", field, messagesBody, countBody)
+		}
+	}
+	for _, field := range []string{"metadata", "max_tokens", "stream", "temperature", "top_p", "top_k", "stop_sequences"} {
+		if gjson.GetBytes(countBody, field).Exists() {
+			t.Fatalf("count_tokens body contains unsupported %s: %s", field, countBody)
+		}
+	}
+}
+
+func TestApplyCloakingOAuthUsesSelectedAccountUUID(t *testing.T) {
+	const sessionID = "123e4567-e89b-42d3-a456-426614174000"
+	const accountUUID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	ctx := withClaudeCanonicalSessionID(context.Background(), sessionID)
+	auth := &cliproxyauth.Auth{
+		Provider: "claude",
+		Metadata: map[string]any{
+			"access_token": "sk-ant-oat-test",
+			"account_uuid": accountUUID,
+		},
+	}
+	out, errCloak := applyCloaking(ctx, &config.Config{}, auth, []byte(`{"messages":[{"role":"user","content":"hello"}]}`), "claude-sonnet-4", "sk-ant-oat-test")
+	if errCloak != nil {
+		t.Fatalf("applyCloaking() error = %v", errCloak)
+	}
+	userID := gjson.GetBytes(out, "metadata.user_id").String()
+	if got := gjson.Get(userID, "account_uuid").String(); got != accountUUID {
+		t.Fatalf("metadata account_uuid = %q, want %q", got, accountUUID)
+	}
+}
+
+func TestResolveClaudeCanonicalSessionRejectsRealClientConflict(t *testing.T) {
+	const headerSession = "11111111-1111-4111-8111-111111111111"
+	const bodySession = "22222222-2222-4222-a222-222222222222"
+	userID, errUserID := helps.BuildClaudeCodeUserIDRequired(strings.Repeat("a", 64), "", bodySession)
+	if errUserID != nil {
+		t.Fatal(errUserID)
+	}
+	payload := []byte(`{"metadata":{"user_id":""},"messages":[{"role":"user","content":"hello"}]}`)
+	payload, _ = sjson.SetBytes(payload, "metadata.user_id", userID)
+	headers := http.Header{
+		"User-Agent":                  {"claude-cli/2.1.215 (external, cli)"},
+		helps.ClaudeCodeSessionHeader: {headerSession},
+	}
+	ctx, headers := resolveClaudeClientContext(context.Background(), headers)
+	if _, errResolve := resolveClaudeCanonicalSessionIDRequired(ctx, payload, payload, headers); errResolve == nil {
+		t.Fatal("expected conflicting real Claude Code sessions to fail")
+	}
+}
+
+func TestResolveClaudeCanonicalSessionRepairsLegacyAndSyntheticConflict(t *testing.T) {
+	const headerSession = "11111111-1111-4111-8111-111111111111"
+	const bodySession = "22222222-2222-4222-a222-222222222222"
+	userID, errUserID := helps.BuildClaudeCodeUserIDRequired(strings.Repeat("b", 64), "", bodySession)
+	if errUserID != nil {
+		t.Fatal(errUserID)
+	}
+	payload := []byte(`{"metadata":{"user_id":""},"messages":[{"role":"user","content":"hello"}]}`)
+	payload, _ = sjson.SetBytes(payload, "metadata.user_id", userID)
+	headers := http.Header{
+		"User-Agent":                  {"third-party/1.0"},
+		helps.ClaudeCodeSessionHeader: {headerSession},
+	}
+	ctx, headers := resolveClaudeClientContext(context.Background(), headers)
+	resolved, errResolve := resolveClaudeCanonicalSessionIDRequired(ctx, payload, payload, headers)
+	if errResolve != nil || resolved != headerSession {
+		t.Fatalf("synthetic conflict resolution = %q, %v; want header session", resolved, errResolve)
+	}
+
+	legacyHeaders := http.Header{helps.ClaudeCodeSessionHeader: {"legacy-session-a"}}
+	legacyCtx, legacyHeaders := resolveClaudeClientContext(context.Background(), legacyHeaders)
+	resolved, errResolve = resolveClaudeCanonicalSessionIDRequired(legacyCtx, []byte(`{"messages":[{"role":"user","content":"hello"}]}`), nil, legacyHeaders)
+	if errResolve != nil {
+		t.Fatalf("legacy session resolution error = %v", errResolve)
+	}
+	if resolved == "legacy-session-a" || !helps.IsValidClaudeCodeUUID(resolved) {
+		t.Fatalf("legacy session was not mapped to a canonical UUID: %q", resolved)
+	}
+}
+
+func TestResolveClaudeClientContextUsesOneUserAgentSource(t *testing.T) {
+	incoming := http.Header{"User-Agent": {"claude-cli/2.1.215 (external, cli)"}}
+	req := newClaudeHeaderTestRequest(t, incoming)
+	ctx, merged := resolveClaudeClientContext(req.Context(), nil)
+	if got := getClientUserAgent(ctx); got != incoming.Get("User-Agent") || merged.Get("User-Agent") != got {
+		t.Fatalf("gin client profile diverged: context=%q merged=%q", got, merged.Get("User-Agent"))
+	}
+
+	forwarded := http.Header{"User-Agent": {"sdk-caller/1.0"}}
+	ctx, merged = resolveClaudeClientContext(req.Context(), forwarded)
+	if got := getClientUserAgent(ctx); got != "sdk-caller/1.0" || merged.Get("User-Agent") != got {
+		t.Fatalf("forwarded client profile diverged: context=%q merged=%q", got, merged.Get("User-Agent"))
+	}
+}
+
+func TestEnforceCacheControlLimitPreservesClaudeCodeSystemAndLatestUser(t *testing.T) {
+	payload := []byte(`{
+		"tools":[{"name":"tool","cache_control":{"type":"ephemeral","ttl":"1h"}}],
+		"system":[
+			{"type":"text","text":"identity","cache_control":{"type":"ephemeral","ttl":"1h"}},
+			{"type":"text","text":"static","cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"}}
+		],
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":"old","cache_control":{"type":"ephemeral","ttl":"1h"}}]},
+			{"role":"user","content":[{"type":"text","text":"latest","cache_control":{"type":"ephemeral","ttl":"1h"}}]}
+		]
+	}`)
+	out := enforceCacheControlLimit(payload, 4)
+	for _, path := range []string{"tools.0.cache_control", "system.0.cache_control", "system.1.cache_control", "messages.1.content.0.cache_control"} {
+		if !gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("valuable breakpoint %s was removed: %s", path, out)
+		}
+	}
+	if gjson.GetBytes(out, "messages.0.content.0.cache_control").Exists() {
+		t.Fatalf("redundant old message breakpoint was retained: %s", out)
+	}
+}
+
+func TestEnforceCacheControlLimitProtectsCapturedGlobalSystemProfile(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"current"}]}]}`)
+	payload = checkSystemInstructionsWithFullSystemPrompt(payload, false, false, true, "2.1.215", "sdk-cli", "", true)
+	payload = ensureClaudeCodeCurrentUserCacheControlWithTTL(payload, "1h")
+	payload, _ = sjson.SetRawBytes(payload, "tools", []byte(`[{"name":"Bash","cache_control":{"type":"ephemeral","ttl":"1h"}}]`))
+
+	systemItems := make([]string, 0, 6)
+	for _, block := range gjson.GetBytes(payload, "system").Array() {
+		systemItems = append(systemItems, block.Raw)
+	}
+	systemItems = append(systemItems,
+		`{"type":"text","text":"customer-extra-1","cache_control":{"type":"ephemeral","ttl":"1h"}}`,
+		`{"type":"text","text":"customer-extra-2","cache_control":{"type":"ephemeral","ttl":"1h"}}`,
+	)
+	payload, _ = sjson.SetRawBytes(payload, "system", rawJSONArray(systemItems))
+
+	messageItems := make([]string, 0, 2)
+	for _, message := range gjson.GetBytes(payload, "messages").Array() {
+		messageItems = append(messageItems, message.Raw)
+	}
+	messageItems = append(messageItems, `{"role":"assistant","content":[{"type":"text","text":"prefill","cache_control":{"type":"ephemeral","ttl":"1h"}}]}`)
+	payload, _ = sjson.SetRawBytes(payload, "messages", rawJSONArray(messageItems))
+
+	out := enforceCacheControlLimit(payload, 4)
+	if got := countCacheControls(out); got != 4 {
+		t.Fatalf("limited cache count = %d, want 4: %s", got, out)
+	}
+	for _, path := range []string{"system.2.cache_control", "system.3.cache_control", "messages.0.content.0.cache_control"} {
+		if !gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("official cache marker %s was removed: %s", path, out)
+		}
+	}
+	for _, path := range []string{"tools.0.cache_control", "system.4.cache_control", "messages.1.content.0.cache_control"} {
+		if gjson.GetBytes(out, path).Exists() {
+			t.Fatalf("lower-priority cache marker %s survived: %s", path, out)
+		}
+	}
+	if !gjson.GetBytes(out, "system.5.cache_control").Exists() {
+		t.Fatalf("one valid customer marker should remain in the fourth available slot: %s", out)
+	}
+}
+
+func TestClaudeCacheControlCollectorCountsToolResultContentButNotToolSchema(t *testing.T) {
+	payload := []byte(`{
+		"tools":[{"name":"tool","input_schema":{"type":"object","properties":{"cache_control":{"type":"string"}}}}],
+		"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":[
+			{"type":"text","text":"one","cache_control":{"type":"ephemeral"}},
+			{"type":"text","text":"two","cache_control":{"type":"ephemeral"}}
+		]}]}]
+	}`)
+	if got := countCacheControls(payload); got != 2 {
+		t.Fatalf("nested tool-result cache count = %d, want 2", got)
+	}
+	payload, _ = sjson.SetRawBytes(payload, "messages.0.content.0.cache_control", []byte(`{"type":"ephemeral"}`))
+	payload, _ = sjson.SetRawBytes(payload, "messages.0.content.0.content.2", []byte(`{"type":"text","text":"three","cache_control":{"type":"ephemeral"}}`))
+	payload, _ = sjson.SetRawBytes(payload, "messages.0.content.0.content.3", []byte(`{"type":"text","text":"four","cache_control":{"type":"ephemeral"}}`))
+	if got := countCacheControls(payload); got != 5 {
+		t.Fatalf("nested cache count = %d, want 5", got)
+	}
+	out := enforceCacheControlLimit(payload, 4)
+	if got := countCacheControls(out); got != 4 {
+		t.Fatalf("limited nested cache count = %d, want 4: %s", got, out)
+	}
+}
+
+func TestEnforceCacheControlLimitDropsMalformedMarkerBeforeOAuthTTLNormalization(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"current"}]}],"tools":[{"name":"Bash","cache_control":"bad"}]}`)
+	payload = checkSystemInstructionsWithFullSystemPrompt(payload, false, false, true, "2.1.215", "sdk-cli", "", true)
+	payload = ensureClaudeCodeCurrentUserCacheControlWithTTL(payload, "1h")
+	payload = enforceCacheControlLimit(payload, 4)
+	payload = normalizeClaudeOAuthCacheControlTTL(payload)
+	payload = normalizeCacheControlTTL(payload)
+	if gjson.GetBytes(payload, "tools.0.cache_control").Exists() {
+		t.Fatalf("malformed marker survived: %s", payload)
+	}
+	for _, path := range []string{"system.2.cache_control.ttl", "system.3.cache_control.ttl", "messages.0.content.0.cache_control.ttl"} {
+		if got := gjson.GetBytes(payload, path).String(); got != "1h" {
+			t.Fatalf("%s = %q, want 1h: %s", path, got, payload)
+		}
+	}
+}
+
+func TestApplyClaudeHeadersRejectsMissingRequestOrOAuthToken(t *testing.T) {
+	if errHeaders := applyClaudeHeaders(nil, nil, "token", false, nil, &config.Config{}, nil); errHeaders == nil {
+		t.Fatal("nil request should fail")
+	}
+	req := httptest.NewRequest(http.MethodPost, "https://api.anthropic.com/v1/messages", nil)
+	if errHeaders := applyClaudeHeaders(req, &cliproxyauth.Auth{Metadata: map[string]any{"auth_kind": "oauth"}}, "", false, nil, &config.Config{}, nil); errHeaders == nil {
+		t.Fatal("empty OAuth token should fail")
 	}
 }

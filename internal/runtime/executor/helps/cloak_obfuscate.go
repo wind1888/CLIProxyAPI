@@ -105,6 +105,13 @@ func obfuscateSystemBlocks(payload []byte, matcher *SensitiveWordMatcher) []byte
 	}
 
 	if system.IsArray() {
+		// CPA-generated Claude Code system arrays start with the signed billing
+		// block. Keep all official blocks byte-for-byte stable: customer system
+		// text has already been forwarded into messages before obfuscation.
+		if strings.HasPrefix(system.Get("0.text").String(), "x-anthropic-billing-header:") {
+			return payload
+		}
+
 		modified := false
 		system.ForEach(func(key, value gjson.Result) bool {
 			if value.Get("type").String() == "text" {
