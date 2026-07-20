@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
 )
 
 func resetSessionIDCache() {
@@ -42,6 +43,22 @@ func (c *fakeClaudeIDKVClient) KVGet(_ context.Context, key string) ([]byte, boo
 		return nil, false, nil
 	}
 	return append([]byte(nil), value...), true, nil
+}
+
+func (c *fakeClaudeIDKVClient) KVSet(_ context.Context, key string, value []byte, opts homekv.KVSetOptions) (bool, error) {
+	c.setCount++
+	if opts.EX > 0 {
+		c.lastSetTTL = opts.EX
+	} else {
+		c.lastSetTTL = opts.PX
+	}
+	if c.setErr != nil {
+		return false, c.setErr
+	}
+	if !c.setNoPersist {
+		c.values[key] = append([]byte(nil), value...)
+	}
+	return true, nil
 }
 
 func (c *fakeClaudeIDKVClient) KVSetNX(_ context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
@@ -107,6 +124,34 @@ func TestCachedSessionIDRequiredHomeReusesKVAcrossLocalCacheReset(t *testing.T) 
 	}
 	if client.lastSetTTL != sessionIDTTL {
 		t.Fatalf("KVSetNX ttl = %v, want %v", client.lastSetTTL, sessionIDTTL)
+	}
+}
+
+func TestCachedSessionIDRequiredHomeReplacesInvalidKV(t *testing.T) {
+	resetSessionIDCache()
+	client := newFakeClaudeIDKVClient()
+	key := claudeSessionIDKVKey("api-key-1")
+	client.values[key] = []byte("not-a-session-uuid")
+	useFakeClaudeIDKVClient(t, client, true, nil)
+
+	value, errValue := CachedSessionIDRequired(context.Background(), "api-key-1")
+	if errValue != nil {
+		t.Fatalf("CachedSessionIDRequired() error = %v", errValue)
+	}
+	if _, errParse := uuid.Parse(value); errParse != nil {
+		t.Fatalf("replacement session id %q is not a UUID: %v", value, errParse)
+	}
+	if got := string(client.values[key]); got != value {
+		t.Fatalf("stored session id = %q, want replacement %q", got, value)
+	}
+	if client.setCount != 1 {
+		t.Fatalf("KVSet count = %d, want 1", client.setCount)
+	}
+	if client.expireCount != 0 {
+		t.Fatalf("KVExpire count = %d, want 0 for invalid replacement", client.expireCount)
+	}
+	if client.lastSetTTL != sessionIDTTL {
+		t.Fatalf("KVSet ttl = %v, want %v", client.lastSetTTL, sessionIDTTL)
 	}
 }
 

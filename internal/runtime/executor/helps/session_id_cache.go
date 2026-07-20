@@ -26,6 +26,7 @@ var (
 
 type claudeIDKVClient interface {
 	KVGet(ctx context.Context, key string) ([]byte, bool, error)
+	KVSet(ctx context.Context, key string, value []byte, opts homekv.KVSetOptions) (bool, error)
 	KVSetNX(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error)
 	KVExpire(ctx context.Context, key string, ttl time.Duration) (bool, error)
 }
@@ -89,13 +90,23 @@ func CachedSessionIDRequired(ctx context.Context, apiKey string) (string, error)
 		if errGet != nil {
 			return "", errGet
 		}
-		if found && strings.TrimSpace(string(raw)) != "" {
+		if found && isValidClaudeCodeUUID(strings.TrimSpace(string(raw))) {
 			if _, errExpire := client.KVExpire(ctx, key, sessionIDTTL); errExpire != nil {
 				return "", errExpire
 			}
 			return strings.TrimSpace(string(raw)), nil
 		}
 		newID := uuid.New().String()
+		if found {
+			written, errSet := client.KVSet(ctx, key, []byte(newID), homekv.KVSetOptions{EX: sessionIDTTL})
+			if errSet != nil {
+				return "", errSet
+			}
+			if !written {
+				return "", fmt.Errorf("home kv session id missing after invalid value replacement")
+			}
+			return newID, nil
+		}
 		if _, errSet := client.KVSetNX(ctx, key, []byte(newID), sessionIDTTL); errSet != nil {
 			return "", errSet
 		}
@@ -103,7 +114,7 @@ func CachedSessionIDRequired(ctx context.Context, apiKey string) (string, error)
 		if errGet != nil {
 			return "", errGet
 		}
-		if found && strings.TrimSpace(string(raw)) != "" {
+		if found && isValidClaudeCodeUUID(strings.TrimSpace(string(raw))) {
 			return strings.TrimSpace(string(raw)), nil
 		}
 		return "", fmt.Errorf("home kv session id missing after set")
@@ -116,12 +127,12 @@ func CachedSessionIDRequired(ctx context.Context, apiKey string) (string, error)
 
 	sessionIDCacheMu.RLock()
 	entry, ok := sessionIDCache[key]
-	valid := ok && entry.value != "" && entry.expire.After(now)
+	valid := ok && entry.value != "" && entry.expire.After(now) && isValidClaudeCodeUUID(entry.value)
 	sessionIDCacheMu.RUnlock()
 	if valid {
 		sessionIDCacheMu.Lock()
 		entry = sessionIDCache[key]
-		if entry.value != "" && entry.expire.After(now) {
+		if entry.value != "" && entry.expire.After(now) && isValidClaudeCodeUUID(entry.value) {
 			entry.expire = now.Add(sessionIDTTL)
 			sessionIDCache[key] = entry
 			sessionIDCacheMu.Unlock()
@@ -134,7 +145,7 @@ func CachedSessionIDRequired(ctx context.Context, apiKey string) (string, error)
 
 	sessionIDCacheMu.Lock()
 	entry, ok = sessionIDCache[key]
-	if !ok || entry.value == "" || !entry.expire.After(now) {
+	if !ok || entry.value == "" || !entry.expire.After(now) || !isValidClaudeCodeUUID(entry.value) {
 		entry.value = newID
 	}
 	entry.expire = now.Add(sessionIDTTL)

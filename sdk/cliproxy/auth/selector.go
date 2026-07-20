@@ -504,7 +504,7 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 
 // ExtractSessionID extracts session identifier from multiple sources.
 // Priority order:
-//  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority for Claude Code clients
+//  1. metadata.user_id (Claude Code JSON or legacy _session_ format) - highest priority for Claude Code clients
 //  2. X-Session-ID header
 //  3. Session_id header (Codex)
 //  4. X-Client-Request-Id header (PI)

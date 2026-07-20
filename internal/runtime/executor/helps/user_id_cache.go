@@ -62,10 +62,24 @@ func CachedUserID(apiKey string) string {
 	return generateFakeUserID()
 }
 
-// CachedUserIDRequired returns a stable fake user ID per apiKey for request-time paths.
+// CachedUserIDRequired returns Claude Code's metadata.user_id string using a
+// stable per-apiKey device_id and the current per-apiKey session_id.
 func CachedUserIDRequired(ctx context.Context, apiKey string) (string, error) {
+	sessionID, errSessionID := CachedSessionIDRequired(ctx, apiKey)
+	if errSessionID != nil {
+		return "", errSessionID
+	}
+	deviceID, errDeviceID := CachedClaudeCodeDeviceIDRequired(ctx, apiKey)
+	if errDeviceID != nil {
+		return "", errDeviceID
+	}
+	return buildClaudeCodeUserID(deviceID, "", sessionID), nil
+}
+
+// CachedClaudeCodeDeviceIDRequired returns a stable Claude Code device_id per apiKey.
+func CachedClaudeCodeDeviceIDRequired(ctx context.Context, apiKey string) (string, error) {
 	if apiKey == "" {
-		return generateFakeUserID(), nil
+		return generateClaudeCodeDeviceID(), nil
 	}
 	client, homeMode, errClient := currentClaudeIDKVClient()
 	if homeMode {
@@ -77,24 +91,34 @@ func CachedUserIDRequired(ctx context.Context, apiKey string) (string, error) {
 		if errGet != nil {
 			return "", errGet
 		}
-		if found && isValidUserID(strings.TrimSpace(string(raw))) {
+		if found && isValidClaudeCodeDeviceID(strings.TrimSpace(string(raw))) {
 			if _, errExpire := client.KVExpire(ctx, key, userIDTTL); errExpire != nil {
 				return "", errExpire
 			}
 			return strings.TrimSpace(string(raw)), nil
 		}
-		newID := generateFakeUserID()
-		if _, errSet := client.KVSetNX(ctx, key, []byte(newID), userIDTTL); errSet != nil {
+		newDeviceID := generateClaudeCodeDeviceID()
+		if found {
+			written, errSet := client.KVSet(ctx, key, []byte(newDeviceID), homekv.KVSetOptions{EX: userIDTTL})
+			if errSet != nil {
+				return "", errSet
+			}
+			if !written {
+				return "", fmt.Errorf("home kv Claude device id missing after invalid value replacement")
+			}
+			return newDeviceID, nil
+		}
+		if _, errSet := client.KVSetNX(ctx, key, []byte(newDeviceID), userIDTTL); errSet != nil {
 			return "", errSet
 		}
 		raw, found, errGet = client.KVGet(ctx, key)
 		if errGet != nil {
 			return "", errGet
 		}
-		if found && isValidUserID(strings.TrimSpace(string(raw))) {
+		if found && isValidClaudeCodeDeviceID(strings.TrimSpace(string(raw))) {
 			return strings.TrimSpace(string(raw)), nil
 		}
-		return "", fmt.Errorf("home kv user id missing after set")
+		return "", fmt.Errorf("home kv Claude device id missing after set")
 	}
 
 	userIDCacheCleanupOnce.Do(startUserIDCacheCleanup)
@@ -104,12 +128,12 @@ func CachedUserIDRequired(ctx context.Context, apiKey string) (string, error) {
 
 	userIDCacheMu.RLock()
 	entry, ok := userIDCache[key]
-	valid := ok && entry.value != "" && entry.expire.After(now) && isValidUserID(entry.value)
+	valid := ok && entry.value != "" && entry.expire.After(now) && isValidClaudeCodeDeviceID(entry.value)
 	userIDCacheMu.RUnlock()
 	if valid {
 		userIDCacheMu.Lock()
 		entry = userIDCache[key]
-		if entry.value != "" && entry.expire.After(now) && isValidUserID(entry.value) {
+		if entry.value != "" && entry.expire.After(now) && isValidClaudeCodeDeviceID(entry.value) {
 			entry.expire = now.Add(userIDTTL)
 			userIDCache[key] = entry
 			userIDCacheMu.Unlock()
@@ -118,12 +142,12 @@ func CachedUserIDRequired(ctx context.Context, apiKey string) (string, error) {
 		userIDCacheMu.Unlock()
 	}
 
-	newID := generateFakeUserID()
+	newDeviceID := generateClaudeCodeDeviceID()
 
 	userIDCacheMu.Lock()
 	entry, ok = userIDCache[key]
-	if !ok || entry.value == "" || !entry.expire.After(now) || !isValidUserID(entry.value) {
-		entry.value = newID
+	if !ok || entry.value == "" || !entry.expire.After(now) || !isValidClaudeCodeDeviceID(entry.value) {
+		entry.value = newDeviceID
 	}
 	entry.expire = now.Add(userIDTTL)
 	userIDCache[key] = entry
@@ -132,5 +156,5 @@ func CachedUserIDRequired(ctx context.Context, apiKey string) (string, error) {
 }
 
 func claudeUserIDKVKey(apiKey string) string {
-	return "cpa:claude:user-id:" + homekv.HashKeyPart(apiKey)
+	return "cpa:claude:device-id:" + homekv.HashKeyPart(apiKey)
 }

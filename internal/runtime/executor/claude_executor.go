@@ -1172,40 +1172,12 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		}
 	}
 
-	baseBetas := "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
-	if val := strings.TrimSpace(strings.Join(incomingHeaders.Values("Anthropic-Beta"), ",")); val != "" {
-		baseBetas = val
-	}
-	if !strings.Contains(baseBetas, "interleaved-thinking") {
-		baseBetas += ",interleaved-thinking-2025-05-14"
-	}
-	if !strings.Contains(baseBetas, "thinking-token-count") {
-		baseBetas += ",thinking-token-count-2026-05-13"
-	}
-
-	// Merge extra betas from request body and request flags.
-	if len(extraBetas) > 0 {
-		existingSet := make(map[string]bool)
-		for _, b := range strings.Split(baseBetas, ",") {
-			betaName := strings.TrimSpace(b)
-			if betaName != "" {
-				existingSet[betaName] = true
-			}
-		}
-		for _, beta := range extraBetas {
-			beta = strings.TrimSpace(beta)
-			if beta != "" && !existingSet[beta] {
-				baseBetas += "," + beta
-				existingSet[beta] = true
-			}
-		}
-	}
-	r.Header.Set("Anthropic-Beta", baseBetas)
+	r.Header.Set("Anthropic-Beta", mergeClaudeBetas(incomingHeaders, extraBetas))
 
 	misc.EnsureHeader(r.Header, incomingHeaders, "Anthropic-Version", "2023-06-01")
-	// Real Claude Code CLI does not send the browser-access opt-in by default.
-	// Preserve it only when the incoming client explicitly provided it.
-	misc.EnsureHeader(r.Header, incomingHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "")
+	if useAPIKey {
+		misc.EnsureHeader(r.Header, incomingHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
+	}
 	misc.EnsureHeader(r.Header, incomingHeaders, "X-App", "cli")
 	// Values below match Claude Code 2.1.215 / @anthropic-ai/sdk 0.94.0 (updated 2026-07-19).
 	misc.EnsureHeader(r.Header, incomingHeaders, "X-Stainless-Retry-Count", "0")
@@ -1239,6 +1211,32 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
 	return nil
+}
+
+const defaultClaudeCodeBetas = "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
+
+func mergeClaudeBetas(incomingHeaders http.Header, extraBetas []string) string {
+	var merged []string
+	seen := make(map[string]bool)
+	add := func(values ...string) {
+		for _, value := range values {
+			for _, beta := range strings.Split(value, ",") {
+				beta = strings.TrimSpace(beta)
+				if beta == "" || seen[beta] {
+					continue
+				}
+				seen[beta] = true
+				merged = append(merged, beta)
+			}
+		}
+	}
+
+	add(defaultClaudeCodeBetas)
+	if incomingHeaders != nil {
+		add(incomingHeaders.Values("Anthropic-Beta")...)
+	}
+	add(extraBetas...)
+	return strings.Join(merged, ",")
 }
 
 func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
@@ -1825,9 +1823,9 @@ func getWorkloadFromContext(ctx context.Context) string {
 // falling back to its stored metadata (the raw OAuth/token JSON). Returns
 // (cloakMode, strictMode, sensitiveWords, cacheUserID, fullSystemPrompt); an empty
 // cloakMode means the credential did not explicitly configure a mode.
-func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (cloakMode string, strictMode bool, sensitiveWords []string, cacheUserID bool, fullSystemPrompt *bool) {
+func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (cloakMode string, strictMode bool, sensitiveWords []string, cacheUserID *bool, fullSystemPrompt *bool) {
 	if auth == nil {
-		return "", false, nil, false, nil
+		return "", false, nil, nil, nil
 	}
 
 	// lookupCloakAttr prefers the executor-facing Attributes, then falls back to the
@@ -1887,7 +1885,7 @@ func getCloakConfigFromAuth(auth *cliproxyauth.Auth) (cloakMode string, strictMo
 		}
 	}
 
-	cacheUserID = strings.EqualFold(lookupCloakAttr("cloak_cache_user_id"), "true")
+	cacheUserID = lookupCloakBoolAttr("cloak_cache_user_id")
 	fullSystemPrompt = lookupCloakBoolAttr("cloak_full_system_prompt")
 
 	return cloakMode, strictMode, sensitiveWords, cacheUserID, fullSystemPrompt
@@ -1905,14 +1903,24 @@ func fullSystemPromptCloakEnabled(cfg *config.Config, auth *cliproxyauth.Auth) b
 	return fullSystemPrompt
 }
 
-// injectFakeUserID generates and injects a fake user ID into the request metadata.
-// When useCache is false, a new user ID is generated for every call.
+// injectFakeUserID generates and injects a Claude Code metadata.user_id string.
+// The session_id is shared with X-Claude-Code-Session-Id; cache controls whether
+// the device_id is reused per API key.
 func injectFakeUserID(ctx context.Context, payload []byte, apiKey string, useCache bool) ([]byte, error) {
 	generateID := func() (string, error) {
-		if useCache {
-			return helps.CachedUserIDRequired(ctx, apiKey)
+		sessionID, errSessionID := helps.CachedSessionIDRequired(ctx, apiKey)
+		if errSessionID != nil {
+			return "", errSessionID
 		}
-		return helps.GenerateFakeUserID(), nil
+		deviceID := helps.GenerateClaudeCodeDeviceID()
+		if useCache {
+			cachedDeviceID, errDeviceID := helps.CachedClaudeCodeDeviceIDRequired(ctx, apiKey)
+			if errDeviceID != nil {
+				return "", errDeviceID
+			}
+			deviceID = cachedDeviceID
+		}
+		return helps.BuildClaudeCodeUserID(deviceID, "", sessionID), nil
 	}
 
 	metadata := gjson.GetBytes(payload, "metadata")
@@ -1926,7 +1934,15 @@ func injectFakeUserID(ctx context.Context, payload []byte, apiKey string, useCac
 	}
 
 	existingUserID := gjson.GetBytes(payload, "metadata.user_id").String()
-	if existingUserID == "" || !helps.IsValidUserID(existingUserID) {
+	existingSessionID := ""
+	if len(existingUserID) > 0 && existingUserID[0] == '{' {
+		existingSessionID = strings.TrimSpace(gjson.Get(existingUserID, "session_id").String())
+	}
+	sessionID, errSessionID := helps.CachedSessionIDRequired(ctx, apiKey)
+	if errSessionID != nil {
+		return nil, errSessionID
+	}
+	if existingUserID == "" || !helps.IsValidUserID(existingUserID) || existingSessionID != sessionID {
 		userID, errUserID := generateID()
 		if errUserID != nil {
 			return nil, errUserID
@@ -2363,11 +2379,14 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	}
 	strictMode := attrStrict
 	sensitiveWords := attrWords
-	cacheUserID := attrCache
+	cacheUserID := true
 	fullSystemPrompt := true
 
 	if attrMode != "" {
 		cloakMode = attrMode
+	}
+	if attrCache != nil {
+		cacheUserID = *attrCache
 	}
 	if attrFullSystemPrompt != nil {
 		fullSystemPrompt = *attrFullSystemPrompt
@@ -2419,6 +2438,7 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	if errFakeUserID != nil {
 		return nil, errFakeUserID
 	}
+	payload = ensureClaudeCodeCurrentUserCacheControl(payload)
 
 	// Apply sensitive word obfuscation
 	if len(sensitiveWords) > 0 {
@@ -2427,6 +2447,77 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 	}
 
 	return payload, nil
+}
+
+func ensureClaudeCodeCurrentUserCacheControl(payload []byte) []byte {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return payload
+	}
+
+	hasMessageCacheControl := false
+	lastUserIdx := -1
+	messages.ForEach(func(index, msg gjson.Result) bool {
+		content := msg.Get("content")
+		if content.IsArray() {
+			content.ForEach(func(_, item gjson.Result) bool {
+				if item.Get("cache_control").Exists() {
+					hasMessageCacheControl = true
+					return false
+				}
+				return true
+			})
+		}
+		if msg.Get("role").String() == "user" {
+			lastUserIdx = int(index.Int())
+		}
+		return !hasMessageCacheControl
+	})
+	if hasMessageCacheControl || lastUserIdx < 0 {
+		return payload
+	}
+
+	contentPath := fmt.Sprintf("messages.%d.content", lastUserIdx)
+	content := gjson.GetBytes(payload, contentPath)
+	if content.IsArray() {
+		targetIdx := -1
+		content.ForEach(func(index, item gjson.Result) bool {
+			if item.Get("type").String() != "text" {
+				return true
+			}
+			text := item.Get("text").String()
+			if strings.TrimSpace(text) == "" || isClaudeSystemReminderText(text) {
+				return true
+			}
+			targetIdx = int(index.Int())
+			return true
+		})
+		if targetIdx < 0 {
+			return payload
+		}
+		cacheControlPath := fmt.Sprintf("%s.%d.cache_control", contentPath, targetIdx)
+		if updated, errSet := sjson.SetBytes(payload, cacheControlPath, map[string]string{"type": "ephemeral"}); errSet == nil {
+			return updated
+		}
+		return payload
+	}
+	if content.Type == gjson.String {
+		text := content.String()
+		if strings.TrimSpace(text) == "" || isClaudeSystemReminderText(text) {
+			return payload
+		}
+		newContent := []map[string]interface{}{
+			{
+				"type":          "text",
+				"text":          text,
+				"cache_control": map[string]string{"type": "ephemeral"},
+			},
+		}
+		if updated, errSet := sjson.SetBytes(payload, contentPath, newContent); errSet == nil {
+			return updated
+		}
+	}
+	return payload
 }
 
 // ensureCacheControl injects cache_control breakpoints into the payload for optimal prompt caching.

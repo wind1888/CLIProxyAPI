@@ -3,33 +3,86 @@ package helps
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 
 	"github.com/google/uuid"
 )
 
-// userIDPattern matches Claude Code format: user_[64-hex]_account_[uuid]_session_[uuid]
-var userIDPattern = regexp.MustCompile(`^user_[a-fA-F0-9]{64}_account_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+var (
+	claudeCodeDeviceIDPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	claudeCodeUUIDPattern     = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+)
 
-// generateFakeUserID generates a fake user ID in Claude Code format.
-// Format: user_[64-hex-chars]_account_[UUID-v4]_session_[UUID-v4]
-func generateFakeUserID() string {
+type claudeCodeUserID struct {
+	DeviceID    string `json:"device_id"`
+	AccountUUID string `json:"account_uuid"`
+	SessionID   string `json:"session_id"`
+}
+
+func generateClaudeCodeDeviceID() string {
 	hexBytes := make([]byte, 32)
 	_, _ = rand.Read(hexBytes)
-	hexPart := hex.EncodeToString(hexBytes)
-	accountUUID := uuid.New().String()
-	sessionUUID := uuid.New().String()
-	return "user_" + hexPart + "_account_" + accountUUID + "_session_" + sessionUUID
+	return hex.EncodeToString(hexBytes)
+}
+
+// generateFakeUserID generates Claude Code's metadata.user_id string format.
+// Format: {"device_id":"<64 hex>","account_uuid":"","session_id":"<uuid>"}
+func generateFakeUserID() string {
+	return buildClaudeCodeUserID(generateClaudeCodeDeviceID(), "", uuid.New().String())
 }
 
 // isValidUserID checks if a user ID matches Claude Code format.
 func isValidUserID(userID string) bool {
-	return userIDPattern.MatchString(userID)
+	var parsed claudeCodeUserID
+	if err := json.Unmarshal([]byte(strings.TrimSpace(userID)), &parsed); err != nil {
+		return false
+	}
+	return isValidClaudeCodeDeviceID(parsed.DeviceID) &&
+		(parsed.AccountUUID == "" || isValidClaudeCodeUUID(parsed.AccountUUID)) &&
+		isValidClaudeCodeUUID(parsed.SessionID)
+}
+
+func isValidClaudeCodeDeviceID(deviceID string) bool {
+	return claudeCodeDeviceIDPattern.MatchString(strings.TrimSpace(deviceID))
+}
+
+func isValidClaudeCodeUUID(value string) bool {
+	return claudeCodeUUIDPattern.MatchString(strings.TrimSpace(value))
+}
+
+func buildClaudeCodeUserID(deviceID, accountUUID, sessionID string) string {
+	deviceID = strings.TrimSpace(deviceID)
+	if !isValidClaudeCodeDeviceID(deviceID) {
+		deviceID = generateClaudeCodeDeviceID()
+	}
+	accountUUID = strings.TrimSpace(accountUUID)
+	if accountUUID != "" && !isValidClaudeCodeUUID(accountUUID) {
+		accountUUID = ""
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if !isValidClaudeCodeUUID(sessionID) {
+		sessionID = uuid.New().String()
+	}
+	return fmt.Sprintf(`{"device_id":"%s","account_uuid":"%s","session_id":"%s"}`, deviceID, accountUUID, sessionID)
 }
 
 func GenerateFakeUserID() string {
 	return generateFakeUserID()
+}
+
+func GenerateClaudeCodeDeviceID() string {
+	return generateClaudeCodeDeviceID()
+}
+
+func BuildClaudeCodeUserID(deviceID, accountUUID, sessionID string) string {
+	return buildClaudeCodeUserID(deviceID, accountUUID, sessionID)
+}
+
+func IsValidClaudeCodeDeviceID(deviceID string) bool {
+	return isValidClaudeCodeDeviceID(deviceID)
 }
 
 func IsValidUserID(userID string) bool {

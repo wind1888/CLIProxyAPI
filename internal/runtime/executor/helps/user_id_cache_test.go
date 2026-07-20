@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/tidwall/gjson"
 )
 
 func resetUserIDCache() {
@@ -15,6 +17,7 @@ func resetUserIDCache() {
 
 func TestCachedUserID_ReusesWithinTTL(t *testing.T) {
 	resetUserIDCache()
+	resetSessionIDCache()
 
 	first := CachedUserID("api-key-1")
 	second := CachedUserID("api-key-1")
@@ -29,12 +32,14 @@ func TestCachedUserID_ReusesWithinTTL(t *testing.T) {
 
 func TestCachedUserID_ExpiresAfterTTL(t *testing.T) {
 	resetUserIDCache()
+	resetSessionIDCache()
 
 	expiredID := CachedUserID("api-key-expired")
+	expiredDeviceID := gjson.Get(expiredID, "device_id").String()
 	cacheKey := userIDCacheKey("api-key-expired")
 	userIDCacheMu.Lock()
 	userIDCache[cacheKey] = userIDCacheEntry{
-		value:  expiredID,
+		value:  expiredDeviceID,
 		expire: time.Now().Add(-time.Minute),
 	}
 	userIDCacheMu.Unlock()
@@ -50,6 +55,7 @@ func TestCachedUserID_ExpiresAfterTTL(t *testing.T) {
 
 func TestCachedUserID_IsScopedByAPIKey(t *testing.T) {
 	resetUserIDCache()
+	resetSessionIDCache()
 
 	first := CachedUserID("api-key-1")
 	second := CachedUserID("api-key-2")
@@ -61,15 +67,17 @@ func TestCachedUserID_IsScopedByAPIKey(t *testing.T) {
 
 func TestCachedUserID_RenewsTTLOnHit(t *testing.T) {
 	resetUserIDCache()
+	resetSessionIDCache()
 
 	key := "api-key-renew"
 	id := CachedUserID(key)
+	deviceID := gjson.Get(id, "device_id").String()
 	cacheKey := userIDCacheKey(key)
 
 	soon := time.Now()
 	userIDCacheMu.Lock()
 	userIDCache[cacheKey] = userIDCacheEntry{
-		value:  id,
+		value:  deviceID,
 		expire: soon.Add(2 * time.Second),
 	}
 	userIDCacheMu.Unlock()
@@ -89,6 +97,7 @@ func TestCachedUserID_RenewsTTLOnHit(t *testing.T) {
 
 func TestCachedUserIDRequiredHomeReusesKVAcrossLocalCacheReset(t *testing.T) {
 	resetUserIDCache()
+	resetSessionIDCache()
 	client := newFakeClaudeIDKVClient()
 	useFakeClaudeIDKVClient(t, client, true, nil)
 
@@ -97,6 +106,7 @@ func TestCachedUserIDRequiredHomeReusesKVAcrossLocalCacheReset(t *testing.T) {
 		t.Fatalf("CachedUserIDRequired() first error = %v", errFirst)
 	}
 	resetUserIDCache()
+	resetSessionIDCache()
 	second, errSecond := CachedUserIDRequired(context.Background(), "api-key-1")
 	if errSecond != nil {
 		t.Fatalf("CachedUserIDRequired() second error = %v", errSecond)
@@ -107,14 +117,40 @@ func TestCachedUserIDRequiredHomeReusesKVAcrossLocalCacheReset(t *testing.T) {
 	if !IsValidUserID(first) {
 		t.Fatalf("user id %q is not valid", first)
 	}
-	if client.setCount != 1 {
-		t.Fatalf("KVSetNX count = %d, want 1", client.setCount)
+	if client.setCount != 2 {
+		t.Fatalf("KVSetNX count = %d, want 2", client.setCount)
 	}
-	if client.expireCount != 1 || client.lastExpireTTL != userIDTTL {
-		t.Fatalf("KVExpire count/ttl = %d/%v, want 1/%v", client.expireCount, client.lastExpireTTL, userIDTTL)
+	if client.expireCount != 2 || client.lastExpireTTL != userIDTTL {
+		t.Fatalf("KVExpire count/ttl = %d/%v, want 2/%v", client.expireCount, client.lastExpireTTL, userIDTTL)
 	}
 	if client.lastSetTTL != userIDTTL {
 		t.Fatalf("KVSetNX ttl = %v, want %v", client.lastSetTTL, userIDTTL)
+	}
+}
+
+func TestCachedUserIDRequiredHomeReplacesInvalidDeviceIDKV(t *testing.T) {
+	resetUserIDCache()
+	resetSessionIDCache()
+	client := newFakeClaudeIDKVClient()
+	sessionKey := claudeSessionIDKVKey("api-key-1")
+	deviceKey := claudeUserIDKVKey("api-key-1")
+	client.values[sessionKey] = []byte("00000000-0000-4000-8000-000000000000")
+	client.values[deviceKey] = []byte("not-a-device-id")
+	useFakeClaudeIDKVClient(t, client, true, nil)
+
+	value, errValue := CachedUserIDRequired(context.Background(), "api-key-1")
+	if errValue != nil {
+		t.Fatalf("CachedUserIDRequired() error = %v", errValue)
+	}
+	if !IsValidUserID(value) {
+		t.Fatalf("replacement user id %q is not valid", value)
+	}
+	deviceID := gjson.Get(value, "device_id").String()
+	if got := string(client.values[deviceKey]); got != deviceID {
+		t.Fatalf("stored device id = %q, want replacement %q", got, deviceID)
+	}
+	if got := gjson.Get(value, "session_id").String(); got != "00000000-0000-4000-8000-000000000000" {
+		t.Fatalf("session id = %q, want cached session", got)
 	}
 }
 
@@ -142,7 +178,8 @@ func TestCachedUserIDRequiredHomeKVFailures(t *testing.T) {
 		{name: "get", client: &fakeClaudeIDKVClient{values: make(map[string][]byte), getErr: errors.New("get failed")}},
 		{name: "set", client: &fakeClaudeIDKVClient{values: make(map[string][]byte), setErr: errors.New("set failed")}},
 		{name: "expire", client: &fakeClaudeIDKVClient{values: map[string][]byte{
-			claudeUserIDKVKey("api-key-1"): []byte(GenerateFakeUserID()),
+			claudeSessionIDKVKey("api-key-1"): []byte("00000000-0000-4000-8000-000000000000"),
+			claudeUserIDKVKey("api-key-1"):    []byte(GenerateClaudeCodeDeviceID()),
 		}, expireErr: errors.New("expire failed")}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

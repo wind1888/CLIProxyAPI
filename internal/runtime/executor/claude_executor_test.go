@@ -70,6 +70,23 @@ func assertClaudeFingerprint(t *testing.T, headers http.Header, userAgent, pkgVe
 	}
 }
 
+func assertClaudeCodeMetadataUserID(t *testing.T, userID string) {
+	t.Helper()
+
+	if !helps.IsValidUserID(userID) {
+		t.Fatalf("metadata.user_id %q is not valid Claude Code JSON", userID)
+	}
+	if got := gjson.Get(userID, "device_id").String(); !helps.IsValidClaudeCodeDeviceID(got) {
+		t.Fatalf("metadata.user_id.device_id = %q, want 64-char hex", got)
+	}
+	if got := gjson.Get(userID, "account_uuid").String(); got != "" {
+		t.Fatalf("metadata.user_id.account_uuid = %q, want empty", got)
+	}
+	if got := gjson.Get(userID, "session_id").String(); got == "" {
+		t.Fatalf("metadata.user_id.session_id is empty in %q", userID)
+	}
+}
+
 func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	stabilize := true
@@ -112,7 +129,7 @@ func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 	}
 }
 
-func TestApplyClaudeHeaders_DoesNotDefaultDangerousDirectBrowserAccess(t *testing.T) {
+func TestApplyClaudeHeaders_DefaultsDangerousDirectBrowserAccessForAPIKey(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 
 	req := newClaudeHeaderTestRequest(t, nil)
@@ -126,30 +143,54 @@ func TestApplyClaudeHeaders_DoesNotDefaultDangerousDirectBrowserAccess(t *testin
 		t.Fatalf("applyClaudeHeaders() error = %v", err)
 	}
 
+	if got := req.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "true" {
+		t.Fatalf("Anthropic-Dangerous-Direct-Browser-Access = %q, want true", got)
+	}
+}
+
+func TestApplyClaudeHeaders_OmitsDangerousDirectBrowserAccessForOAuth(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+
+	req := newClaudeHeaderTestRequest(t, nil)
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"access_token": "oauth-token-danger",
+		},
+	}
+
+	if err := applyClaudeHeaders(req, auth, "oauth-token-danger", false, nil, &config.Config{}, nil); err != nil {
+		t.Fatalf("applyClaudeHeaders() error = %v", err)
+	}
+
 	if got := req.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "" {
 		t.Fatalf("Anthropic-Dangerous-Direct-Browser-Access = %q, want empty", got)
 	}
 }
 
-func TestApplyClaudeHeaders_PreservesExplicitDangerousDirectBrowserAccess(t *testing.T) {
+func TestApplyClaudeHeaders_MergesIncomingBetaWithOfficialDefaults(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 
 	incoming := http.Header{
-		"Anthropic-Dangerous-Direct-Browser-Access": []string{"true"},
+		"Anthropic-Beta": []string{"custom-beta-2026-07-20,context-management-2025-06-27"},
 	}
 	req := newClaudeHeaderTestRequest(t, incoming)
 	auth := &cliproxyauth.Auth{
 		Attributes: map[string]string{
-			"api_key": "key-danger-explicit",
+			"api_key": "key-beta",
 		},
 	}
 
-	if err := applyClaudeHeaders(req, auth, "key-danger-explicit", false, nil, &config.Config{}, incoming); err != nil {
+	if err := applyClaudeHeaders(req, auth, "key-beta", false, []string{"extra-beta-2026-07-20"}, &config.Config{}, incoming); err != nil {
 		t.Fatalf("applyClaudeHeaders() error = %v", err)
 	}
 
-	if got := req.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "true" {
-		t.Fatalf("Anthropic-Dangerous-Direct-Browser-Access = %q, want true", got)
+	got := req.Header.Get("Anthropic-Beta")
+	want := defaultClaudeCodeBetas + ",custom-beta-2026-07-20,extra-beta-2026-07-20"
+	if got != want {
+		t.Fatalf("Anthropic-Beta = %q, want %q", got, want)
+	}
+	if strings.Count(got, "context-management-2025-06-27") != 1 {
+		t.Fatalf("Anthropic-Beta should de-duplicate official beta, got %q", got)
 	}
 }
 
@@ -1433,10 +1474,11 @@ func TestClaudeExecutor_ReusesUserIDAcrossModelsWhenCacheEnabled(t *testing.T) {
 	if !helps.IsValidUserID(userIDs[0]) {
 		t.Fatalf("user_id %q is not valid", userIDs[0])
 	}
+	assertClaudeCodeMetadataUserID(t, userIDs[0])
 	t.Logf("✓ End-to-end test passed: Same user_id (%s) was used for both models", userIDs[0])
 }
 
-func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
+func TestClaudeExecutor_ReusesUserIDByDefault(t *testing.T) {
 	var userIDs []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -1448,8 +1490,50 @@ func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
 
 	executor := NewClaudeExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"api_key":  "key-123",
+		"api_key":  "key-default-cache",
 		"base_url": server.URL,
+	}}
+
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	for i := 0; i < 2; i++ {
+		if _, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+			Model:   "claude-3-5-sonnet",
+			Payload: payload,
+		}, cliproxyexecutor.Options{
+			SourceFormat: sdktranslator.FromString("claude"),
+		}); err != nil {
+			t.Fatalf("Execute call %d error: %v", i, err)
+		}
+	}
+
+	if len(userIDs) != 2 {
+		t.Fatalf("expected 2 requests, got %d", len(userIDs))
+	}
+	if userIDs[0] == "" || userIDs[1] == "" {
+		t.Fatal("expected user_id to be populated")
+	}
+	if userIDs[0] != userIDs[1] {
+		t.Fatalf("expected user_id to be reused by default, got %q and %q", userIDs[0], userIDs[1])
+	}
+	assertClaudeCodeMetadataUserID(t, userIDs[0])
+}
+
+func TestClaudeExecutor_GeneratesNewUserIDWhenCacheDisabled(t *testing.T) {
+	var userIDs []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		userIDs = append(userIDs, gjson.GetBytes(body, "metadata.user_id").String())
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-3-5-sonnet","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":             "key-cache-disabled",
+		"base_url":            server.URL,
+		"cloak_cache_user_id": "false",
 	}}
 
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
@@ -1477,6 +1561,8 @@ func TestClaudeExecutor_GeneratesNewUserIDByDefault(t *testing.T) {
 	if !helps.IsValidUserID(userIDs[0]) || !helps.IsValidUserID(userIDs[1]) {
 		t.Fatalf("user_ids should be valid, got %q and %q", userIDs[0], userIDs[1])
 	}
+	assertClaudeCodeMetadataUserID(t, userIDs[0])
+	assertClaudeCodeMetadataUserID(t, userIDs[1])
 }
 
 func TestClaudeExecutor_ExecuteOpenAINonStreamRejectsEmptyClaudeStream(t *testing.T) {
@@ -1741,6 +1827,29 @@ func TestEnforceCacheControlLimit_ToolOnlyPayloadStillRespectsLimit(t *testing.T
 	}
 	if !gjson.GetBytes(out, "tools.4.cache_control").Exists() {
 		t.Fatalf("last tool cache_control should be preserved when possible")
+	}
+}
+
+func TestEnsureClaudeCodeCurrentUserCacheControl_SkipsSystemReminders(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>\nctx\n</system-reminder>"},{"type":"text","text":"Reply only OK"}]}]}`)
+
+	out := ensureClaudeCodeCurrentUserCacheControl(payload)
+
+	if gjson.GetBytes(out, "messages.0.content.0.cache_control").Exists() {
+		t.Fatalf("system-reminder block should not receive cache_control: %s", string(out))
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.1.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("real user prompt cache_control.type = %q, want ephemeral: %s", got, string(out))
+	}
+}
+
+func TestEnsureClaudeCodeCurrentUserCacheControl_PreservesClientCacheControl(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"client cached","cache_control":{"type":"ephemeral"}},{"type":"text","text":"Reply only OK"}]}]}`)
+
+	out := ensureClaudeCodeCurrentUserCacheControl(payload)
+
+	if !bytes.Equal(out, payload) {
+		t.Fatalf("payload with existing message cache_control should be unchanged.\noriginal: %s\ngot:      %s", payload, out)
 	}
 }
 
@@ -2852,9 +2961,11 @@ func TestApplyCloaking_FullSystemPromptAuthAttrOptOut(t *testing.T) {
 
 func TestClaudeExecutor_SDKCLIIdentityFollowsClientEntrypoint(t *testing.T) {
 	var seenBody []byte
+	var seenHeaders http.Header
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		seenBody = bytes.Clone(body)
+		seenHeaders = r.Header.Clone()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-3-5-sonnet","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
 	}))
@@ -2887,6 +2998,23 @@ func TestClaudeExecutor_SDKCLIIdentityFollowsClientEntrypoint(t *testing.T) {
 	}
 	if got := gjson.GetBytes(seenBody, "system.1.cache_control.type").String(); got != "ephemeral" {
 		t.Fatalf("sdk-cli identity cache_control.type = %q, want ephemeral", got)
+	}
+	if got := seenHeaders.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "true" {
+		t.Fatalf("Anthropic-Dangerous-Direct-Browser-Access = %q, want true", got)
+	}
+	if got := seenHeaders.Get("Accept"); got != "application/json" {
+		t.Fatalf("Accept = %q, want application/json", got)
+	}
+	if got := seenHeaders.Get("Accept-Encoding"); got != "gzip, deflate, br, zstd" {
+		t.Fatalf("Accept-Encoding = %q, want gzip, deflate, br, zstd", got)
+	}
+	userID := gjson.GetBytes(seenBody, "metadata.user_id").String()
+	assertClaudeCodeMetadataUserID(t, userID)
+	if got, want := gjson.Get(userID, "session_id").String(), seenHeaders.Get("X-Claude-Code-Session-Id"); got != want {
+		t.Fatalf("metadata.user_id.session_id = %q, want X-Claude-Code-Session-Id %q", got, want)
+	}
+	if got := gjson.GetBytes(seenBody, "messages.0.content.0.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("current user prompt cache_control.type = %q, want ephemeral; body=%s", got, string(seenBody))
 	}
 }
 

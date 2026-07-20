@@ -344,7 +344,7 @@ type RoutingConfig struct {
 
 	// SessionAffinity enables universal session-sticky routing for all clients.
 	// Session IDs are extracted from multiple sources:
-	// metadata.user_id (Claude Code session format), X-Session-ID, Session_id (Codex),
+	// metadata.user_id (Claude Code JSON or legacy _session_ format), X-Session-ID, Session_id (Codex),
 	// X-Client-Request-Id (PI), metadata.user_id, conversation_id, or message hash.
 	// Automatic failover is always enabled when bound auth becomes unavailable.
 	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
@@ -438,8 +438,10 @@ type CloakConfig struct {
 	// This can help bypass certain content filters.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
 
-	// CacheUserID controls whether Claude user_id values are cached per API key.
-	// When false, a fresh random user_id is generated for every request.
+	// CacheUserID controls whether Claude Code metadata.user_id device_id values
+	// are cached per API key. When nil or true, the device_id is reused like a
+	// Claude Code installation; set false to generate a fresh random device_id
+	// for every cloaked request.
 	CacheUserID *bool `yaml:"cache-user-id,omitempty" json:"cache-user-id,omitempty"`
 
 	// FullSystemPrompt controls whether cloaking appends Claude Code's static
