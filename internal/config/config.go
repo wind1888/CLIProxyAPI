@@ -441,6 +441,11 @@ type CloakConfig struct {
 	// CacheUserID controls whether Claude user_id values are cached per API key.
 	// When false, a fresh random user_id is generated for every request.
 	CacheUserID *bool `yaml:"cache-user-id,omitempty" json:"cache-user-id,omitempty"`
+
+	// FullSystemPrompt controls whether cloaking appends the full Claude Code
+	// static system prompt after the billing and identity system blocks.
+	// When nil or true, cloaking appends it; set false for minimal billing + identity.
+	FullSystemPrompt *bool `yaml:"full-system-prompt,omitempty" json:"full-system-prompt,omitempty"`
 }
 
 // ClaudeKey represents the configuration for a Claude API key,

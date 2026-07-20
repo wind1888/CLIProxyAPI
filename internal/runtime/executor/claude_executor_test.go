@@ -2402,8 +2402,8 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	}
 
 	blocks := system.Array()
-	if len(blocks) != 2 {
-		t.Fatalf("expected 2 system blocks, got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
 	}
 
 	if !strings.HasPrefix(blocks[0].Get("text").String(), "x-anthropic-billing-header:") {
@@ -2411,6 +2411,9 @@ func TestCheckSystemInstructionsWithMode_StringSystemPreserved(t *testing.T) {
 	}
 	if blocks[1].Get("text").String() != "You are Claude Code, Anthropic's official CLI for Claude." {
 		t.Fatalf("blocks[1] should be agent block, got %q", blocks[1].Get("text").String())
+	}
+	if !strings.Contains(blocks[2].Get("text").String(), "# Doing tasks") {
+		t.Fatalf("blocks[2] should be full static prompt, got %q", blocks[2].Get("text").String())
 	}
 	if got := gjson.GetBytes(out, "messages.0.content").String(); got != expectedForwardedSystemReminder("You are a helpful assistant.")+"hi" {
 		t.Fatalf("messages[0].content should include forwarded system prompt, got %q", got)
@@ -2424,8 +2427,8 @@ func TestCheckSystemInstructionsWithMode_StringSystemStrict(t *testing.T) {
 	out := checkSystemInstructionsWithMode(payload, true)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 2 {
-		t.Fatalf("strict mode should produce 2 injected blocks, got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("strict mode should produce 3 injected blocks, got %d", len(blocks))
 	}
 	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "hi" {
 		t.Fatalf("strict mode should not forward system prompt into messages, got %q", got)
@@ -2439,8 +2442,8 @@ func TestCheckSystemInstructionsWithMode_EmptyStringSystemIgnored(t *testing.T) 
 	out := checkSystemInstructionsWithMode(payload, false)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 2 {
-		t.Fatalf("empty string system should still produce 2 injected blocks, got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("empty string system should still produce 3 injected blocks, got %d", len(blocks))
 	}
 	if got := gjson.GetBytes(out, "messages.0.content").String(); got != "hi" {
 		t.Fatalf("empty string system should not alter messages, got %q", got)
@@ -2454,8 +2457,8 @@ func TestCheckSystemInstructionsWithMode_ArraySystemStillWorks(t *testing.T) {
 	out := checkSystemInstructionsWithMode(payload, false)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 2 {
-		t.Fatalf("expected 2 system blocks, got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
 	}
 	if got := gjson.GetBytes(out, "messages.0.content").String(); got != expectedForwardedSystemReminder("Be concise.")+"hi" {
 		t.Fatalf("messages[0].content should include forwarded array system prompt, got %q", got)
@@ -2469,8 +2472,8 @@ func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 	out := checkSystemInstructionsWithMode(payload, false)
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 2 {
-		t.Fatalf("expected 2 system blocks, got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("expected 3 system blocks, got %d", len(blocks))
 	}
 	if got := gjson.GetBytes(out, "messages.0.content").String(); got != expectedForwardedSystemReminder(`Use <xml> tags & "quotes" in output.`)+"hi" {
 		t.Fatalf("forwarded system prompt text mangled, got %q", got)
@@ -2482,8 +2485,8 @@ func TestCheckSystemInstructionsWithSigningMode_OAuthPreservesClientContent(t *t
 
 	out := checkSystemInstructionsWithSigningMode(payload, false, false, true, "2.1.215", "cli", "")
 
-	if got := len(gjson.GetBytes(out, "system").Array()); got != 2 {
-		t.Fatalf("expected only billing and identity system blocks, got %d", got)
+	if got := len(gjson.GetBytes(out, "system").Array()); got != 3 {
+		t.Fatalf("expected billing, identity, and full static prompt system blocks, got %d", got)
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != expectedForwardedSystemReminder("Keep this exact client rule.") {
 		t.Fatalf("client system content was not preserved, got %q", got)
@@ -2496,7 +2499,7 @@ func TestCheckSystemInstructionsWithSigningMode_OAuthPreservesClientContent(t *t
 	}
 }
 
-func TestClaudeExecutor_OAuthMinimalCloakPreservesClientContent(t *testing.T) {
+func TestClaudeExecutor_OAuthDefaultFullCloakPreservesClientContent(t *testing.T) {
 	var seenBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -2522,11 +2525,14 @@ func TestClaudeExecutor_OAuthMinimalCloakPreservesClientContent(t *testing.T) {
 	}
 
 	blocks := gjson.GetBytes(seenBody, "system").Array()
-	if len(blocks) != 2 {
-		t.Fatalf("expected only billing and identity system blocks, got %d: %s", len(blocks), gjson.GetBytes(seenBody, "system").Raw)
+	if len(blocks) != 3 {
+		t.Fatalf("expected billing, identity, and full static prompt system blocks, got %d: %s", len(blocks), gjson.GetBytes(seenBody, "system").Raw)
 	}
 	if got := blocks[1].Get("text").String(); got != "You are Claude Code, Anthropic's official CLI for Claude." {
 		t.Fatalf("identity block = %q", got)
+	}
+	if !strings.Contains(blocks[2].Get("text").String(), "# Doing tasks") {
+		t.Fatalf("full static prompt missing Doing tasks section: %q", blocks[2].Get("text").String())
 	}
 	if got := gjson.GetBytes(seenBody, "messages.0.content.0.text").String(); got != expectedForwardedSystemReminder("  Keep this exact client rule.  ") {
 		t.Fatalf("client system content was not preserved, got %q", got)
@@ -2587,6 +2593,131 @@ func TestCheckSystemInstructionsWithSigningMode_SDKCLIIdentityMatchesClaude215(t
 	}
 	if gjson.GetBytes(cliOut, "system.1.cache_control").Exists() {
 		t.Fatalf("cli identity should not include cache_control: %s", gjson.GetBytes(cliOut, "system.1").Raw)
+	}
+}
+
+func TestCheckSystemInstructionsWithFullSystemPrompt_AddsStaticPromptBlock(t *testing.T) {
+	payload := []byte(`{"system":[{"type":"text","text":"Client rule"}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
+
+	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", true)
+
+	blocks := gjson.GetBytes(out, "system").Array()
+	if len(blocks) != 3 {
+		t.Fatalf("system block count = %d, want 3: %s", len(blocks), gjson.GetBytes(out, "system").Raw)
+	}
+	if got, want := blocks[0].Get("text").String(), "x-anthropic-billing-header: cc_version=2.1.215.d68; cc_entrypoint=sdk-cli;"; got != want {
+		t.Fatalf("billing header = %q, want %q", got, want)
+	}
+	if got, want := blocks[1].Get("text").String(), "You are a Claude agent, built on Anthropic's Claude Agent SDK."; got != want {
+		t.Fatalf("identity block = %q, want %q", got, want)
+	}
+	if got := blocks[1].Get("cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("identity cache_control.type = %q, want ephemeral", got)
+	}
+	staticPrompt := blocks[2].Get("text").String()
+	for _, want := range []string{
+		"You are an interactive agent that helps users with software engineering tasks.",
+		"# System",
+		"# Doing tasks",
+		"# Executing actions with care",
+		"# Using your tools",
+		"# Tone and style",
+		"# Text output",
+	} {
+		if !strings.Contains(staticPrompt, want) {
+			t.Fatalf("static prompt missing %q: %q", want, staticPrompt)
+		}
+	}
+	if got := blocks[2].Get("cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("static prompt cache_control.type = %q, want ephemeral", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != expectedForwardedSystemReminder("Client rule") {
+		t.Fatalf("client system content was not preserved, got %q", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.1.text").String(); got != "Reply only OK" {
+		t.Fatalf("original user text changed, got %q", got)
+	}
+}
+
+func TestCheckSystemInstructionsWithFullSystemPrompt_DedupesFullClientStaticPrompt(t *testing.T) {
+	payload := []byte(`{"system":[{"type":"text","text":""}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
+	payload, _ = sjson.SetBytes(payload, "system.0.text", helps.ClaudeCodeStaticSystemPrompt)
+
+	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", true)
+
+	if got := len(gjson.GetBytes(out, "system").Array()); got != 3 {
+		t.Fatalf("system block count = %d, want 3: %s", got, gjson.GetBytes(out, "system").Raw)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.#").Int(); got != 1 {
+		t.Fatalf("messages.0.content count = %d, want 1: %s", got, gjson.GetBytes(out, "messages.0.content").Raw)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != "Reply only OK" {
+		t.Fatalf("original user text changed, got %q", got)
+	}
+}
+
+func TestCheckSystemInstructionsWithFullSystemPrompt_DedupesStaticSectionsAndKeepsCustomText(t *testing.T) {
+	mixedClientSystem := helps.ClaudeCodeDoingTasks + "\n\n请始终使用中文回答。\n\n" + helps.ClaudeCodeUsingTools
+	payload := []byte(`{"system":[{"type":"text","text":""}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
+	payload, _ = sjson.SetBytes(payload, "system.0.text", mixedClientSystem)
+
+	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", true)
+
+	forwarded := gjson.GetBytes(out, "messages.0.content.0.text").String()
+	if !strings.Contains(forwarded, "请始终使用中文回答。") {
+		t.Fatalf("custom client system text was not preserved, got %q", forwarded)
+	}
+	for _, duplicate := range []string{"# Doing tasks", "# Using your tools"} {
+		if strings.Contains(forwarded, duplicate) {
+			t.Fatalf("forwarded system reminder still contains duplicate section %q: %q", duplicate, forwarded)
+		}
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.1.text").String(); got != "Reply only OK" {
+		t.Fatalf("original user text changed, got %q", got)
+	}
+}
+
+func TestCheckSystemInstructionsWithFullSystemPrompt_KeepsSimilarButModifiedClientPrompt(t *testing.T) {
+	modifiedDoingTasks := strings.Replace(helps.ClaudeCodeDoingTasks, "The user will primarily request", "The customer will primarily request", 1)
+	payload := []byte(`{"system":[{"type":"text","text":""}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
+	payload, _ = sjson.SetBytes(payload, "system.0.text", modifiedDoingTasks)
+
+	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", true)
+
+	forwarded := gjson.GetBytes(out, "messages.0.content.0.text").String()
+	if !strings.Contains(forwarded, "# Doing tasks") || !strings.Contains(forwarded, "The customer will primarily request") {
+		t.Fatalf("modified client prompt should be preserved, got %q", forwarded)
+	}
+}
+
+func TestCheckSystemInstructionsWithFullSystemPrompt_DedupeDisabledForMinimalCloak(t *testing.T) {
+	payload := []byte(`{"system":[{"type":"text","text":""}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
+	payload, _ = sjson.SetBytes(payload, "system.0.text", helps.ClaudeCodeDoingTasks)
+
+	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", false)
+
+	if got := len(gjson.GetBytes(out, "system").Array()); got != 2 {
+		t.Fatalf("system block count = %d, want 2: %s", got, gjson.GetBytes(out, "system").Raw)
+	}
+	forwarded := gjson.GetBytes(out, "messages.0.content.0.text").String()
+	if !strings.Contains(forwarded, "# Doing tasks") {
+		t.Fatalf("minimal cloak should keep client prompt unchanged, got %q", forwarded)
+	}
+}
+
+func TestApplyCloaking_FullSystemPromptAuthAttrOptOut(t *testing.T) {
+	cfg := &config.Config{}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"cloak_full_system_prompt": "false",
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	out, errCloaking := applyCloaking(context.Background(), cfg, auth, payload, "claude-3-5-sonnet-20241022", "")
+	if errCloaking != nil {
+		t.Fatalf("applyCloaking() error = %v", errCloaking)
+	}
+	if got := len(gjson.GetBytes(out, "system").Array()); got != 2 {
+		t.Fatalf("system block count = %d, want 2: %s", got, gjson.GetBytes(out, "system").Raw)
 	}
 }
 
@@ -2837,14 +2968,65 @@ func TestApplyCloaking_PreservesConfiguredStrictModeAndSensitiveWordsWhenModeOmi
 	}
 
 	blocks := gjson.GetBytes(out, "system").Array()
-	if len(blocks) != 2 {
-		t.Fatalf("expected strict mode to keep the 2 injected Claude Code system blocks, got %d", len(blocks))
+	if len(blocks) != 3 {
+		t.Fatalf("expected strict mode to keep the 3 injected Claude Code system blocks, got %d", len(blocks))
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.#").Int(); got != 1 {
 		t.Fatalf("strict mode should not prepend a forwarded system reminder block, got %d content blocks", got)
 	}
 	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); !strings.Contains(got, "\u200B") {
 		t.Fatalf("expected configured sensitive word obfuscation to apply, got %q", got)
+	}
+}
+
+func TestApplyCloaking_FullSystemPromptDefaultEnabled(t *testing.T) {
+	cfg := &config.Config{
+		ClaudeKey: []config.ClaudeKey{{
+			APIKey: "key-123",
+		}},
+	}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{"api_key": "key-123"}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	out, errCloaking := applyCloaking(context.Background(), cfg, auth, payload, "claude-3-5-sonnet-20241022", "key-123")
+	if errCloaking != nil {
+		t.Fatalf("applyCloaking() error = %v", errCloaking)
+	}
+
+	blocks := gjson.GetBytes(out, "system").Array()
+	if len(blocks) != 3 {
+		t.Fatalf("system block count = %d, want 3: %s", len(blocks), gjson.GetBytes(out, "system").Raw)
+	}
+	if !strings.Contains(blocks[2].Get("text").String(), "# Doing tasks") {
+		t.Fatalf("full static prompt missing Doing tasks section: %q", blocks[2].Get("text").String())
+	}
+	if got := blocks[2].Get("cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("full static prompt cache_control.type = %q, want ephemeral", got)
+	}
+}
+
+func TestApplyCloaking_FullSystemPromptConfigOptOutOverridesAuthAttr(t *testing.T) {
+	fullSystemPrompt := false
+	cfg := &config.Config{
+		ClaudeKey: []config.ClaudeKey{{
+			APIKey: "key-123",
+			Cloak: &config.CloakConfig{
+				FullSystemPrompt: &fullSystemPrompt,
+			},
+		}},
+	}
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":                  "key-123",
+		"cloak_full_system_prompt": "true",
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
+
+	out, errCloaking := applyCloaking(context.Background(), cfg, auth, payload, "claude-3-5-sonnet-20241022", "key-123")
+	if errCloaking != nil {
+		t.Fatalf("applyCloaking() error = %v", errCloaking)
+	}
+	if got := len(gjson.GetBytes(out, "system").Array()); got != 2 {
+		t.Fatalf("system block count = %d, want 2: %s", got, gjson.GetBytes(out, "system").Raw)
 	}
 }
 
