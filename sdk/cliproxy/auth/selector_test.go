@@ -740,6 +740,25 @@ func TestExtractSessionID_MessageHashFallback(t *testing.T) {
 	}
 }
 
+func TestExtractStableSessionID_PreservesFirstTurnAliasAcrossHistory(t *testing.T) {
+	t.Parallel()
+
+	firstTurn := []byte(`{"messages":[{"role":"user","content":"Hello world"}]}`)
+	multiTurn := []byte(`{"messages":[
+		{"role":"user","content":"Hello world"},
+		{"role":"assistant","content":"Hi! How can I help?"},
+		{"role":"user","content":"Tell me a joke"}
+	]}`)
+	firstScope := ExtractStableSessionID(nil, firstTurn, nil)
+	multiScope := ExtractStableSessionID(nil, multiTurn, nil)
+	if firstScope == "" || multiScope != firstScope {
+		t.Fatalf("stable session changed across history: first=%q multi=%q", firstScope, multiScope)
+	}
+	if primary := ExtractSessionID(nil, multiTurn, nil); primary == multiScope {
+		t.Fatalf("test fixture did not exercise primary/fallback split: primary=%q stable=%q", primary, multiScope)
+	}
+}
+
 func TestExtractSessionID_ClaudeAPITopLevelSystem(t *testing.T) {
 	t.Parallel()
 
@@ -1273,5 +1292,127 @@ func TestSessionAffinitySelector_Concurrent(t *testing.T) {
 	case err := <-errCh:
 		t.Fatalf("concurrent Pick() error = %v", err)
 	default:
+	}
+}
+
+type blockingSessionFallback struct {
+	mu           sync.Mutex
+	calls        int
+	firstEntered chan struct{}
+	releaseFirst chan struct{}
+	releaseOnce  sync.Once
+}
+
+func newBlockingSessionFallback() *blockingSessionFallback {
+	return &blockingSessionFallback{
+		firstEntered: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+}
+
+func (s *blockingSessionFallback) Pick(_ context.Context, _, _ string, _ cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	if call == 1 {
+		close(s.firstEntered)
+		<-s.releaseFirst
+	}
+	return auths[(call-1)%len(auths)], nil
+}
+
+func (s *blockingSessionFallback) release() {
+	s.releaseOnce.Do(func() { close(s.releaseFirst) })
+}
+
+func (s *blockingSessionFallback) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func TestSessionAffinitySelector_ConcurrentColdStartBindsOnce(t *testing.T) {
+	fallback := newBlockingSessionFallback()
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: fallback,
+		TTL:      time.Minute,
+	})
+	defer selector.Stop()
+
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}, {ID: "auth-c"}}
+	opts := cliproxyexecutor.Options{
+		Headers: http.Header{"X-Session-Id": []string{"cold-start"}},
+	}
+	const goroutines = 32
+	results := make(chan *Auth, goroutines)
+	errors := make(chan error, goroutines)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			auth, err := selector.Pick(context.Background(), "claude", "claude-3", opts, auths)
+			if err != nil {
+				errors <- err
+				return
+			}
+			results <- auth
+		}()
+	}
+	close(start)
+	<-fallback.firstEntered
+
+	cacheKey := "claude::header:cold-start::claude-3"
+	deadline := time.Now().Add(2 * time.Second)
+	allWaiting := false
+	for time.Now().Before(deadline) {
+		selector.keyLocks.mu.Lock()
+		keyLock := selector.keyLocks.locks[cacheKey]
+		refs := 0
+		if keyLock != nil {
+			refs = keyLock.refs
+		}
+		selector.keyLocks.mu.Unlock()
+		if refs == goroutines {
+			allWaiting = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !allWaiting {
+		fallback.release()
+		wg.Wait()
+		t.Fatal("concurrent Pick calls did not all reach the same session-key lock")
+	}
+	if got := fallback.callCount(); got != 1 {
+		fallback.release()
+		wg.Wait()
+		t.Fatalf("fallback Pick() calls before binding = %d, want 1", got)
+	}
+
+	fallback.release()
+	wg.Wait()
+	close(results)
+	close(errors)
+	for err := range errors {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	for auth := range results {
+		if auth == nil || auth.ID != "auth-a" {
+			t.Fatalf("concurrent cold Pick() auth = %#v, want auth-a", auth)
+		}
+	}
+	if got := fallback.callCount(); got != 1 {
+		t.Fatalf("fallback Pick() total calls = %d, want 1", got)
+	}
+
+	selector.keyLocks.mu.Lock()
+	remainingLocks := len(selector.keyLocks.locks)
+	selector.keyLocks.mu.Unlock()
+	if remainingLocks != 0 {
+		t.Fatalf("session key lock table retained %d entries after Pick calls", remainingLocks)
 	}
 }

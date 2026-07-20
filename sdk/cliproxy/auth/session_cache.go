@@ -13,10 +13,12 @@ type sessionEntry struct {
 
 // SessionCache provides TTL-based session to auth mapping with automatic cleanup.
 type SessionCache struct {
-	mu      sync.RWMutex
-	entries map[string]sessionEntry
-	ttl     time.Duration
-	stopCh  chan struct{}
+	mu       sync.RWMutex
+	entries  map[string]sessionEntry
+	ttl      time.Duration
+	stopCh   chan struct{}
+	doneCh   chan struct{}
+	stopOnce sync.Once
 }
 
 // NewSessionCache creates a cache with the specified TTL.
@@ -29,6 +31,7 @@ func NewSessionCache(ttl time.Duration) *SessionCache {
 		entries: make(map[string]sessionEntry),
 		ttl:     ttl,
 		stopCh:  make(chan struct{}),
+		doneCh:  make(chan struct{}),
 	}
 	go c.cleanupLoop()
 	return c
@@ -47,12 +50,21 @@ func (c *SessionCache) Get(sessionID string) (string, bool) {
 		return "", false
 	}
 	if time.Now().After(entry.expiresAt) {
-		c.mu.Lock()
-		delete(c.entries, sessionID)
-		c.mu.Unlock()
+		c.deleteExpiredIfUnchanged(sessionID, entry)
 		return "", false
 	}
 	return entry.authID, true
+}
+
+// deleteExpiredIfUnchanged removes an entry only if it is still the same entry
+// observed by Get. A concurrent Set must not be deleted by a stale Get.
+func (c *SessionCache) deleteExpiredIfUnchanged(sessionID string, observed sessionEntry) {
+	c.mu.Lock()
+	current, ok := c.entries[sessionID]
+	if ok && current == observed && time.Now().After(current.expiresAt) {
+		delete(c.entries, sessionID)
+	}
+	c.mu.Unlock()
 }
 
 // GetAndRefresh retrieves the auth ID bound to a session and refreshes TTL on hit.
@@ -120,15 +132,19 @@ func (c *SessionCache) InvalidateAuth(authID string) {
 
 // Stop terminates the background cleanup goroutine.
 func (c *SessionCache) Stop() {
-	select {
-	case <-c.stopCh:
-	default:
+	c.stopOnce.Do(func() {
 		close(c.stopCh)
-	}
+	})
+	<-c.doneCh
 }
 
 func (c *SessionCache) cleanupLoop() {
-	ticker := time.NewTicker(c.ttl / 2)
+	defer close(c.doneCh)
+	interval := c.ttl / 2
+	if interval < time.Millisecond {
+		interval = time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {

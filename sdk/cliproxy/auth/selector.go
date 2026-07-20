@@ -369,8 +369,50 @@ var sessionPattern = regexp.MustCompile(`_session_([a-f0-9-]+)$`)
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
-	fallback Selector
-	cache    *SessionCache
+	fallback    Selector
+	ttl         time.Duration
+	lifecycleMu sync.Mutex
+	cache       *SessionCache
+	keyLocks    sessionAffinityKeyLocks
+}
+
+type sessionAffinityKeyLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// sessionAffinityKeyLocks serializes creation and failover of a binding for one
+// cache key without serializing unrelated sessions. Entries are removed after
+// the last holder or waiter leaves, so the lock table does not grow with every
+// session ever observed.
+type sessionAffinityKeyLocks struct {
+	mu    sync.Mutex
+	locks map[string]*sessionAffinityKeyLock
+}
+
+func (l *sessionAffinityKeyLocks) lock(key string) func() {
+	l.mu.Lock()
+	if l.locks == nil {
+		l.locks = make(map[string]*sessionAffinityKeyLock)
+	}
+	keyLock := l.locks[key]
+	if keyLock == nil {
+		keyLock = &sessionAffinityKeyLock{}
+		l.locks[key] = keyLock
+	}
+	keyLock.refs++
+	l.mu.Unlock()
+
+	keyLock.mu.Lock()
+	return func() {
+		keyLock.mu.Unlock()
+		l.mu.Lock()
+		keyLock.refs--
+		if keyLock.refs == 0 {
+			delete(l.locks, key)
+		}
+		l.mu.Unlock()
+	}
 }
 
 // SessionAffinityConfig configures the session affinity selector.
@@ -397,6 +439,7 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 	}
 	return &SessionAffinitySelector{
 		fallback: cfg.Fallback,
+		ttl:      cfg.TTL,
 		cache:    NewSessionCache(cfg.TTL),
 	}
 }
@@ -417,10 +460,15 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
 	entry := selectorLogEntry(ctx)
 	primaryID, fallbackID := extractSessionIDs(opts.Headers, opts.OriginalRequest, opts.Metadata)
-	if primaryID == "" {
+	cache := s.currentCache()
+	if primaryID == "" || cache == nil {
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
 		return s.fallback.Pick(ctx, provider, model, opts, auths)
 	}
+
+	cacheKey := provider + "::" + primaryID + "::" + model
+	unlock := s.keyLocks.lock(cacheKey)
+	defer unlock()
 
 	now := time.Now()
 	available, err := getAvailableAuths(auths, provider, model, now)
@@ -428,9 +476,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		return nil, err
 	}
 
-	cacheKey := provider + "::" + primaryID + "::" + model
-
-	if cachedAuthID, ok := s.cache.GetAndRefresh(cacheKey); ok {
+	if cachedAuthID, ok := cache.GetAndRefresh(cacheKey); ok {
 		for _, auth := range available {
 			if auth.ID == cachedAuthID {
 				entry.Infof("session-affinity: cache hit | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
@@ -442,17 +488,17 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		if err != nil {
 			return nil, err
 		}
-		s.cache.Set(cacheKey, auth.ID)
+		cache.Set(cacheKey, auth.ID)
 		entry.Infof("session-affinity: cache hit but auth unavailable, reselected | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 		return auth, nil
 	}
 
 	if fallbackID != "" && fallbackID != primaryID {
 		fallbackKey := provider + "::" + fallbackID + "::" + model
-		if cachedAuthID, ok := s.cache.Get(fallbackKey); ok {
+		if cachedAuthID, ok := cache.Get(fallbackKey); ok {
 			for _, auth := range available {
 				if auth.ID == cachedAuthID {
-					s.cache.Set(cacheKey, auth.ID)
+					cache.Set(cacheKey, auth.ID)
 					entry.Infof("session-affinity: fallback cache hit | session=%s fallback=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), truncateSessionID(fallbackID), auth.ID, provider, model)
 					return auth, nil
 				}
@@ -464,9 +510,37 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 	if err != nil {
 		return nil, err
 	}
-	s.cache.Set(cacheKey, auth.ID)
+	cache.Set(cacheKey, auth.ID)
 	entry.Infof("session-affinity: cache miss, new binding | session=%s auth=%s provider=%s model=%s", truncateSessionID(primaryID), auth.ID, provider, model)
 	return auth, nil
+}
+
+// Start activates the selector after it has previously been stopped. A fresh
+// cache is intentional: once a selector is retired, its old bindings no longer
+// describe the newly installed routing epoch.
+func (s *SessionAffinitySelector) Start() {
+	if s == nil {
+		return
+	}
+	s.lifecycleMu.Lock()
+	if s.cache == nil {
+		ttl := s.ttl
+		if ttl <= 0 {
+			ttl = time.Hour
+		}
+		s.cache = NewSessionCache(ttl)
+	}
+	s.lifecycleMu.Unlock()
+}
+
+func (s *SessionAffinitySelector) currentCache() *SessionCache {
+	if s == nil {
+		return nil
+	}
+	s.lifecycleMu.Lock()
+	cache := s.cache
+	s.lifecycleMu.Unlock()
+	return cache
 }
 
 func selectorLogEntry(ctx context.Context) *log.Entry {
@@ -489,16 +563,23 @@ func truncateSessionID(id string) string {
 
 // Stop releases resources held by the selector.
 func (s *SessionAffinitySelector) Stop() {
-	if s.cache != nil {
-		s.cache.Stop()
+	if s == nil {
+		return
 	}
+	s.lifecycleMu.Lock()
+	cache := s.cache
+	s.cache = nil
+	if cache != nil {
+		cache.Stop()
+	}
+	s.lifecycleMu.Unlock()
 }
 
 // InvalidateAuth removes all session bindings for a specific auth.
 // Called when an auth becomes rate-limited or unavailable.
 func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
-	if s.cache != nil {
-		s.cache.InvalidateAuth(authID)
+	if cache := s.currentCache(); cache != nil {
+		cache.InvalidateAuth(authID)
 	}
 }
 
@@ -513,6 +594,18 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 //  7. Stable hash from first few messages content (fallback)
 func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]any) string {
 	primary, _ := extractSessionIDs(headers, payload, metadata)
+	return primary
+}
+
+// ExtractStableSessionID returns the most stable available downstream session
+// identity. For transcript-derived IDs it prefers the short first-turn alias,
+// which remains constant after assistant history is appended; explicit client
+// session identifiers retain their normal priority.
+func ExtractStableSessionID(headers http.Header, payload []byte, metadata map[string]any) string {
+	primary, fallback := extractSessionIDs(headers, payload, metadata)
+	if fallback != "" {
+		return fallback
+	}
 	return primary
 }
 

@@ -21,10 +21,17 @@ import (
 )
 
 func resetAntigravityCreditsRetryState() {
-	antigravityCreditsFailureByAuth = sync.Map{}
-	antigravityShortCooldownByAuth = sync.Map{}
-	antigravityCreditsBalanceByAuth = sync.Map{}
-	antigravityCreditsHintRefreshByID = sync.Map{}
+	clearAntigravityCreditsTestMap(&antigravityCreditsFailureByAuth)
+	clearAntigravityCreditsTestMap(&antigravityShortCooldownByAuth)
+	clearAntigravityCreditsTestMap(&antigravityCreditsBalanceByAuth)
+	clearAntigravityCreditsTestMap(&antigravityCreditsHintRefreshByID)
+}
+
+func clearAntigravityCreditsTestMap(values *sync.Map) {
+	values.Range(func(key, _ any) bool {
+		values.Delete(key)
+		return true
+	})
 }
 
 type fakeAntigravityKVClient struct {

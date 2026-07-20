@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -223,8 +224,12 @@ type Manager struct {
 	selector      Selector
 	hook          Hook
 	mu            sync.RWMutex
-	auths         map[string]*Auth
-	scheduler     *authScheduler
+	// selectorLifecycleMu serializes selector activation, publication, and
+	// retirement. In particular, it prevents an A -> B transition from stopping
+	// A after a concurrent B -> A transition has made A current again.
+	selectorLifecycleMu sync.Mutex
+	auths               map[string]*Auth
+	scheduler           *authScheduler
 	// pluginScheduler runs outside m.mu before falling back to native selection.
 	pluginScheduler PluginScheduler
 	// homeRuntimeAuths caches auths returned by Home so websocket sessions can
@@ -273,6 +278,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	if hook == nil {
 		hook = NoopHook{}
 	}
+	startSelector(selector)
 	manager := &Manager{
 		store:            store,
 		executors:        make(map[string]ProviderExecutor),
@@ -469,13 +475,66 @@ func (m *Manager) SetSelector(selector Selector) {
 	if selector == nil {
 		selector = &RoundRobinSelector{}
 	}
+
+	// Keep the complete lifecycle transition ordered. Stopping the replaced
+	// selector outside this critical section permits an ABA race:
+	// A -> B publishes B, B -> A publishes A, then the first transition stops
+	// the now-current A. A restartable selector is activated before publication
+	// so a previously retired SessionAffinitySelector can be reused safely.
+	m.selectorLifecycleMu.Lock()
+	defer m.selectorLifecycleMu.Unlock()
+	startSelector(selector)
+
 	m.mu.Lock()
+	previous := m.selector
 	m.selector = selector
+	scheduler := m.scheduler
+	if scheduler != nil {
+		// Keep the scheduler strategy update ordered with the selector swap.
+		// Concurrent SetSelector calls must not leave the scheduler configured
+		// for a selector that is no longer current.
+		scheduler.setSelector(selector)
+	}
 	m.mu.Unlock()
-	if m.scheduler != nil {
-		m.scheduler.setSelector(selector)
+	if scheduler != nil {
 		m.syncScheduler()
 	}
+	if !sameSelectorInstance(previous, selector) {
+		if stoppable, ok := previous.(StoppableSelector); ok {
+			stoppable.Stop()
+		}
+	}
+}
+
+// startSelector activates selectors whose resources can be restarted after a
+// previous retirement. Selectors without an explicit Start method retain the
+// existing lifecycle contract.
+func startSelector(selector Selector) {
+	if startable, ok := selector.(interface{ Start() }); ok {
+		startable.Start()
+	}
+}
+
+// sameSelectorInstance reports whether two selector interfaces refer to the
+// same selector. Resource-owning selectors are expected to be pointers; the
+// comparable fallback also handles stateless value selectors without risking
+// an interface-comparison panic for non-comparable implementations.
+func sameSelectorInstance(left, right Selector) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftValue := reflect.ValueOf(left)
+	rightValue := reflect.ValueOf(right)
+	if leftValue.Type() != rightValue.Type() {
+		return false
+	}
+	if leftValue.Kind() == reflect.Pointer {
+		return leftValue.Pointer() == rightValue.Pointer()
+	}
+	if leftValue.Type().Comparable() {
+		return leftValue.Interface() == rightValue.Interface()
+	}
+	return false
 }
 
 // SetStore swaps the underlying persistence store.
@@ -2292,7 +2351,10 @@ func (m *Manager) invalidateSessionAffinity(authID string) {
 	if m == nil || authID == "" {
 		return
 	}
-	if invalidator, ok := m.selector.(interface{ InvalidateAuth(string) }); ok && invalidator != nil {
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	if invalidator, ok := selector.(interface{ InvalidateAuth(string) }); ok && invalidator != nil {
 		invalidator.InvalidateAuth(authID)
 	}
 }
@@ -4561,7 +4623,10 @@ func (m *Manager) useSchedulerFastPath() bool {
 	if m == nil || m.scheduler == nil {
 		return false
 	}
-	return isBuiltInSelector(m.selector)
+	m.mu.RLock()
+	selector := m.selector
+	m.mu.RUnlock()
+	return isBuiltInSelector(selector)
 }
 
 func shouldRetrySchedulerPick(err error) bool {
@@ -5621,16 +5686,23 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 // StopAutoRefresh cancels the background refresh loop, if running.
 // It also stops the selector if it implements StoppableSelector.
 func (m *Manager) StopAutoRefresh() {
+	if m == nil {
+		return
+	}
+	m.selectorLifecycleMu.Lock()
+	defer m.selectorLifecycleMu.Unlock()
+
 	m.mu.Lock()
 	cancel := m.refreshCancel
 	m.refreshCancel = nil
 	m.refreshLoop = nil
+	selector := m.selector
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
-	if stoppable, ok := m.selector.(StoppableSelector); ok {
+	if stoppable, ok := selector.(StoppableSelector); ok {
 		stoppable.Stop()
 	}
 }
