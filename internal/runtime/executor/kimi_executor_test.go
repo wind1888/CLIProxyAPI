@@ -176,7 +176,7 @@ func TestKimiExecutorClaudeStreamForwardsAnthropicBetaAndLogsUpstream(t *testing
 		t.Fatalf("upstream URL = %q, want Kimi messages endpoint", got)
 	}
 	upstreamBetas := upstreamRequest.Header.Get("Anthropic-Beta")
-	for _, beta := range []string{"client-beta-one", "client-beta-two", "oauth-2025-04-20", "interleaved-thinking-2025-05-14"} {
+	for _, beta := range []string{"client-beta-one", "client-beta-two", "interleaved-thinking-2025-05-14", "thinking-token-count-2026-05-13"} {
 		if !strings.Contains(upstreamBetas, beta) {
 			t.Fatalf("Anthropic-Beta = %q, want %q", upstreamBetas, beta)
 		}

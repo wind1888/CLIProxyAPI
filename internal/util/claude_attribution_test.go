@@ -10,12 +10,12 @@ func TestIsClaudeCodeAttributionSystemText(t *testing.T) {
 	}{
 		{
 			name: "Claude Code attribution block",
-			text: "x-anthropic-billing-header: cc_version=2.1.63.abc; cc_entrypoint=cli; cch=12345;",
+			text: "x-anthropic-billing-header: cc_version=2.1.215.d68; cc_entrypoint=cli;",
 			want: true,
 		},
 		{
 			name: "leading whitespace",
-			text: "\n\t x-anthropic-billing-header: cc_version=2.1.63.abc; cch=12345;",
+			text: "\n\t x-anthropic-billing-header: cc_version=2.1.215.d68; cc_entrypoint=cli;",
 			want: true,
 		},
 		{

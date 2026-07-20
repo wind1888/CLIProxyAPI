@@ -83,7 +83,7 @@ func TestConvertClaudeRequestToGemini_StripsClaudeCodeAttribution(t *testing.T) 
 	inputJSON := []byte(`{
 		"model": "claude-sonnet-4-5",
 		"system": [
-			{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.63.abc; cc_entrypoint=cli; cch=12345;"},
+				{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.215.d68; cc_entrypoint=cli;"},
 			{"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
 			{"type": "text", "text": "User system prompt"}
 		],

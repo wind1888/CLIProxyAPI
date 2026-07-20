@@ -117,7 +117,7 @@ func TestConvertClaudeRequestToAntigravity_StripsClaudeCodeAttribution(t *testin
 		"model": "claude-sonnet-4-5",
 		"messages": [{"role": "user", "content": [{"type": "text", "text": "Hello"}]}],
 		"system": [
-			{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.63.abc; cc_entrypoint=cli; cch=12345;"},
+				{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.215.d68; cc_entrypoint=cli;"},
 			{"type": "text", "text": "Antigravity system prompt"}
 		]
 	}`)

@@ -343,8 +343,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, claudeToolPrefix, auth.ToolPrefixDisabled())
 	}
 	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel)
-	// Enable cch signing by default for OAuth tokens (not just experimental flag).
-	// Claude Code always computes cch; missing or invalid cch is a detectable fingerprint.
+	// OAuth and opt-in paths keep the first-party cch placeholder, then sign the final body.
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
@@ -535,7 +534,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		bodyForUpstream, oauthToolNamesReverseMap = prepareClaudeOAuthToolNamesForUpstream(bodyForUpstream, claudeToolPrefix, auth.ToolPrefixDisabled())
 	}
 	bodyForUpstream = sanitizeClaudeMessagesForClaudeUpstreamWithDebug(ctx, bodyForUpstream, baseModel)
-	// Enable cch signing by default for OAuth tokens (not just experimental flag).
+	// OAuth and opt-in paths keep the first-party cch placeholder, then sign the final body.
 	if oauthToken || experimentalCCHSigningEnabled(e.cfg, auth) {
 		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
@@ -1163,15 +1162,15 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		}
 	}
 
-	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05,structured-outputs-2025-12-15,fast-mode-2026-02-01,redact-thinking-2026-02-12,token-efficient-tools-2026-03-28"
+	baseBetas := "claude-code-20250219,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
 	if val := strings.TrimSpace(strings.Join(incomingHeaders.Values("Anthropic-Beta"), ",")); val != "" {
 		baseBetas = val
-		if !strings.Contains(val, "oauth") {
-			baseBetas += ",oauth-2025-04-20"
-		}
 	}
 	if !strings.Contains(baseBetas, "interleaved-thinking") {
 		baseBetas += ",interleaved-thinking-2025-05-14"
+	}
+	if !strings.Contains(baseBetas, "thinking-token-count") {
+		baseBetas += ",thinking-token-count-2026-05-13"
 	}
 
 	// Merge extra betas from request body and request flags.
@@ -1199,7 +1198,7 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		misc.EnsureHeader(r.Header, incomingHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
 	}
 	misc.EnsureHeader(r.Header, incomingHeaders, "X-App", "cli")
-	// Values below match Claude Code 2.1.63 / @anthropic-ai/sdk 0.74.0 (updated 2026-02-28).
+	// Values below match Claude Code 2.1.215 / @anthropic-ai/sdk 0.94.0 (updated 2026-07-19).
 	misc.EnsureHeader(r.Header, incomingHeaders, "X-Stainless-Retry-Count", "0")
 	misc.EnsureHeader(r.Header, incomingHeaders, "X-Stainless-Runtime", "node")
 	misc.EnsureHeader(r.Header, incomingHeaders, "X-Stainless-Lang", "js")
@@ -1264,7 +1263,7 @@ func claudeCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
 }
 
 func checkSystemInstructions(payload []byte) []byte {
-	return checkSystemInstructionsWithSigningMode(payload, false, false, false, "2.1.63", "", "")
+	return checkSystemInstructionsWithSigningMode(payload, false, false, false, helps.DefaultClaudeVersion(nil), "", "")
 }
 
 func rebuildMidSystemMessagesToTopLevel(payload []byte) []byte {
@@ -1906,7 +1905,7 @@ func injectFakeUserID(ctx context.Context, payload []byte, apiKey string, useCac
 const fingerprintSalt = "59cf53e54c78"
 
 // computeFingerprint computes the 3-char build fingerprint that Claude Code embeds in cc_version.
-// Algorithm: SHA256(salt + messageText[4] + messageText[7] + messageText[20] + version)[:3]
+// Algorithm: SHA256(salt + firstUserText[4] + firstUserText[7] + firstUserText[20] + version)[:3]
 func computeFingerprint(messageText, version string) string {
 	indices := [3]int{4, 7, 20}
 	runes := []rune(messageText)
@@ -1925,29 +1924,54 @@ func computeFingerprint(messageText, version string) string {
 
 // generateBillingHeader creates the x-anthropic-billing-header text block that
 // real Claude Code prepends to every system prompt array.
-// Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=<ep>; cch=<hash>; [cc_workload=<wl>;]
-func generateBillingHeader(payload []byte, experimentalCCHSigning bool, version, messageText, entrypoint, workload string) string {
+// Format: x-anthropic-billing-header: cc_version=<ver>.<build>; cc_entrypoint=<ep>; [cch=<hash>;] [cc_workload=<wl>;]
+func generateBillingHeader(_ []byte, experimentalCCHSigning bool, version, messageText, entrypoint, workload string) string {
 	if entrypoint == "" {
 		entrypoint = "cli"
 	}
 	buildHash := computeFingerprint(messageText, version)
+	cchPart := ""
+	if experimentalCCHSigning {
+		cchPart = " cch=00000;"
+	}
 	workloadPart := ""
 	if workload != "" {
 		workloadPart = fmt.Sprintf(" cc_workload=%s;", workload)
 	}
-
-	if experimentalCCHSigning {
-		return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s; cch=00000;%s", version, buildHash, entrypoint, workloadPart)
-	}
-
-	// Generate a deterministic cch hash from the payload content (system + messages + tools).
-	h := sha256.Sum256(payload)
-	cch := hex.EncodeToString(h[:])[:5]
-	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s; cch=%s;%s", version, buildHash, entrypoint, cch, workloadPart)
+	return fmt.Sprintf("x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s;%s%s", version, buildHash, entrypoint, cchPart, workloadPart)
 }
 
 func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
-	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, false, "2.1.63", "", "")
+	return checkSystemInstructionsWithSigningMode(payload, strictMode, false, false, helps.DefaultClaudeVersion(nil), "", "")
+}
+
+func claudeFirstUserText(payload []byte) string {
+	messages := gjson.GetBytes(payload, "messages")
+	if !messages.IsArray() {
+		return ""
+	}
+	firstText := ""
+	messages.ForEach(func(_, message gjson.Result) bool {
+		if !strings.EqualFold(strings.TrimSpace(message.Get("role").String()), "user") || message.Get("isMeta").Bool() {
+			return true
+		}
+		content := message.Get("content")
+		if content.Type == gjson.String {
+			firstText = content.String()
+			return false
+		}
+		if content.IsArray() {
+			content.ForEach(func(_, part gjson.Result) bool {
+				if part.Get("type").String() == "text" {
+					firstText = part.Get("text").String()
+					return false
+				}
+				return true
+			})
+		}
+		return firstText == ""
+	})
+	return firstText
 }
 
 // checkSystemInstructionsWithSigningMode injects Claude Code-style system blocks:
@@ -1957,21 +1981,7 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 //	client system messages: moved to the first user message when strict mode is disabled
 func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string) []byte {
 	system := gjson.GetBytes(payload, "system")
-
-	// Extract original message text for fingerprint computation (before billing injection).
-	// Use the first system text block's content as the fingerprint source.
-	messageText := ""
-	if system.IsArray() {
-		system.ForEach(func(_, part gjson.Result) bool {
-			if part.Get("type").String() == "text" {
-				messageText = part.Get("text").String()
-				return false
-			}
-			return true
-		})
-	} else if system.Type == gjson.String {
-		messageText = system.String()
-	}
+	messageText := claudeFirstUserText(payload)
 
 	// Skip if already injected
 	firstText := gjson.GetBytes(payload, "system.0.text").String()
@@ -2101,7 +2111,7 @@ IMPORTANT: this context may or may not be relevant to your tasks. You should not
 // Cloaking includes: system prompt injection, fake user ID, and sensitive word obfuscation.
 func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, payload []byte, model string, apiKey string) ([]byte, error) {
 	clientUserAgent := getClientUserAgent(ctx)
-	// Enable cch signing for OAuth tokens by default (not just experimental flag).
+	// OAuth and opt-in paths keep the first-party cch placeholder, then sign the final body.
 	oauthToken := isClaudeOAuthToken(apiKey)
 	useCCHSigning := oauthToken || experimentalCCHSigningEnabled(cfg, auth)
 

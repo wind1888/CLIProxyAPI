@@ -2480,7 +2480,7 @@ func TestCheckSystemInstructionsWithMode_StringWithSpecialChars(t *testing.T) {
 func TestCheckSystemInstructionsWithSigningMode_OAuthPreservesClientContent(t *testing.T) {
 	payload := []byte(`{"system":[{"type":"text","text":"Keep this exact client rule."}],"tools":[{"name":"client_tool","description":"Client tool","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":"client_tool"},"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
-	out := checkSystemInstructionsWithSigningMode(payload, false, false, true, "2.1.63", "cli", "")
+	out := checkSystemInstructionsWithSigningMode(payload, false, false, true, "2.1.215", "cli", "")
 
 	if got := len(gjson.GetBytes(out, "system").Array()); got != 2 {
 		t.Fatalf("expected only billing and identity system blocks, got %d", got)
@@ -2559,7 +2559,17 @@ func TestClaudeExecutor_OAuthMinimalCloakPreservesClientContent(t *testing.T) {
 	}
 }
 
-func TestClaudeExecutor_ExperimentalCCHSigningDisabledByDefaultKeepsLegacyHeader(t *testing.T) {
+func TestCheckSystemInstructionsWithSigningMode_UsesClaude215UserFingerprint(t *testing.T) {
+	payload := []byte(`{"system":[{"type":"text","text":"Different system text"}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
+
+	out := checkSystemInstructionsWithSigningMode(payload, true, false, false, "2.1.215", "sdk-cli", "")
+
+	if got, want := gjson.GetBytes(out, "system.0.text").String(), "x-anthropic-billing-header: cc_version=2.1.215.d68; cc_entrypoint=sdk-cli;"; got != want {
+		t.Fatalf("billing header = %q, want %q", got, want)
+	}
+}
+
+func TestClaudeExecutor_ExperimentalCCHSigningDisabledByDefaultOmitsCCH(t *testing.T) {
 	var seenBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -2591,8 +2601,11 @@ func TestClaudeExecutor_ExperimentalCCHSigningDisabledByDefaultKeepsLegacyHeader
 	if !strings.HasPrefix(billingHeader, "x-anthropic-billing-header:") {
 		t.Fatalf("system.0.text = %q, want billing header", billingHeader)
 	}
-	if strings.Contains(billingHeader, "cch=00000;") {
-		t.Fatalf("legacy mode should not forward cch placeholder, got %q", billingHeader)
+	if !strings.Contains(billingHeader, "cc_version=2.1.215.") {
+		t.Fatalf("billing header should use Claude Code 2.1.215, got %q", billingHeader)
+	}
+	if strings.Contains(billingHeader, " cch=") {
+		t.Fatalf("default API key mode should not forward cch, got %q", billingHeader)
 	}
 }
 
