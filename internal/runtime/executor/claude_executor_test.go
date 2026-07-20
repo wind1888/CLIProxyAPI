@@ -2569,6 +2569,67 @@ func TestCheckSystemInstructionsWithSigningMode_UsesClaude215UserFingerprint(t *
 	}
 }
 
+func TestCheckSystemInstructionsWithSigningMode_SDKCLIIdentityMatchesClaude215(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
+
+	out := checkSystemInstructionsWithSigningMode(payload, true, false, false, "2.1.215", "sdk-cli", "")
+
+	if got, want := gjson.GetBytes(out, "system.1.text").String(), "You are a Claude agent, built on Anthropic's Claude Agent SDK."; got != want {
+		t.Fatalf("sdk-cli identity = %q, want %q", got, want)
+	}
+	if got := gjson.GetBytes(out, "system.1.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("sdk-cli identity cache_control.type = %q, want ephemeral", got)
+	}
+
+	cliOut := checkSystemInstructionsWithSigningMode(payload, true, false, false, "2.1.215", "cli", "")
+	if got, want := gjson.GetBytes(cliOut, "system.1.text").String(), "You are Claude Code, Anthropic's official CLI for Claude."; got != want {
+		t.Fatalf("cli identity = %q, want %q", got, want)
+	}
+	if gjson.GetBytes(cliOut, "system.1.cache_control").Exists() {
+		t.Fatalf("cli identity should not include cache_control: %s", gjson.GetBytes(cliOut, "system.1").Raw)
+	}
+}
+
+func TestClaudeExecutor_SDKCLIIdentityFollowsClientEntrypoint(t *testing.T) {
+	var seenBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		seenBody = bytes.Clone(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","model":"claude-3-5-sonnet","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}`))
+	}))
+	defer server.Close()
+
+	executor := NewClaudeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"api_key":    "key-123",
+		"base_url":   server.URL,
+		"cloak_mode": "always",
+	}}
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
+	ctx := contextWithGinHeaders(map[string]string{"User-Agent": "claude-cli/2.1.215 (external, sdk-cli)"})
+
+	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
+		Model:   "claude-3-5-sonnet-20241022",
+		Payload: payload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude")})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(seenBody) == 0 {
+		t.Fatal("expected request body to be captured")
+	}
+	if got, want := gjson.GetBytes(seenBody, "system.0.text").String(), "x-anthropic-billing-header: cc_version=2.1.215.d68; cc_entrypoint=sdk-cli;"; got != want {
+		t.Fatalf("billing header = %q, want %q", got, want)
+	}
+	if got, want := gjson.GetBytes(seenBody, "system.1.text").String(), "You are a Claude agent, built on Anthropic's Claude Agent SDK."; got != want {
+		t.Fatalf("sdk-cli identity = %q, want %q", got, want)
+	}
+	if got := gjson.GetBytes(seenBody, "system.1.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("sdk-cli identity cache_control.type = %q, want ephemeral", got)
+	}
+}
+
 func TestClaudeExecutor_ExperimentalCCHSigningDisabledByDefaultOmitsCCH(t *testing.T) {
 	var seenBody []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

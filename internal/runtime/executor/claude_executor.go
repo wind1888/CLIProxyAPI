@@ -1977,7 +1977,7 @@ func claudeFirstUserText(payload []byte) string {
 // checkSystemInstructionsWithSigningMode injects Claude Code-style system blocks:
 //
 //	system[0]: billing header (no cache_control)
-//	system[1]: agent identifier (no cache_control)
+//	system[1]: agent identifier (sdk-cli uses SDK identity with ephemeral cache_control)
 //	client system messages: moved to the first user message when strict mode is disabled
 func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string) []byte {
 	system := gjson.GetBytes(payload, "system")
@@ -1992,11 +1992,7 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	billingText := generateBillingHeader(payload, experimentalCCHSigning, version, messageText, entrypoint, workload)
 	billingBlock := buildTextBlock(billingText, nil)
 
-	// Build system blocks matching real Claude Code structure.
-	// Important: Claude Code's internal cacheScope='org' does NOT serialize to
-	// scope='org' in the API request. Only scope='global' is sent explicitly.
-	// The system prompt prefix block is sent without cache_control.
-	agentBlock := buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", nil)
+	agentBlock := claudeIdentityBlock(entrypoint)
 	systemResult := "[" + billingBlock + "," + agentBlock + "]"
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
 
@@ -2029,6 +2025,13 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	}
 
 	return payload
+}
+
+func claudeIdentityBlock(entrypoint string) string {
+	if strings.EqualFold(strings.TrimSpace(entrypoint), "sdk-cli") {
+		return buildTextBlock("You are a Claude agent, built on Anthropic's Claude Agent SDK.", map[string]string{"type": "ephemeral"})
+	}
+	return buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", nil)
 }
 
 // sanitizeForwardedSystemPrompt keeps the client-provided system context intact
