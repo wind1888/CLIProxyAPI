@@ -2032,7 +2032,8 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 //
 //	system[0]: billing header (no cache_control)
 //	system[1]: agent identifier (sdk-cli uses SDK identity with ephemeral cache_control)
-//	system[2]: optional full Claude Code static prompt (ephemeral cache_control)
+//	system[2]: optional full Claude Code prompt (static prompt plus client-provided
+//	official dynamic sections, ephemeral cache_control)
 //	client system messages: moved to the first user message when strict mode is disabled
 func checkSystemInstructionsWithFullSystemPrompt(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string, fullSystemPrompt bool) []byte {
 	system := gjson.GetBytes(payload, "system")
@@ -2049,35 +2050,27 @@ func checkSystemInstructionsWithFullSystemPrompt(payload []byte, strictMode bool
 
 	agentBlock := claudeIdentityBlock(entrypoint)
 	systemResult := "[" + billingBlock + "," + agentBlock
+	userSystemParts := claudePlainSystemTextParts(system)
+	dynamicSystemPromptParts := []string(nil)
+	forwardedSystemParts := userSystemParts
 	if fullSystemPrompt {
-		staticPromptBlock := buildTextBlock(helps.ClaudeCodeStaticSystemPrompt, map[string]string{"type": "ephemeral"})
-		systemResult += "," + staticPromptBlock
+		dynamicSections, forwardedParts := splitClaudeCodeSystemPromptParts(userSystemParts)
+		forwardedSystemParts = forwardedParts
+		dynamicSystemPromptParts = claudeCodeDynamicSectionTexts(dynamicSections)
+		fullPromptText := helps.ClaudeCodeStaticSystemPrompt
+		if len(dynamicSystemPromptParts) > 0 {
+			fullPromptText += "\n\n" + strings.Join(dynamicSystemPromptParts, "\n\n")
+		}
+		systemPromptBlock := buildTextBlock(fullPromptText, map[string]string{"type": "ephemeral"})
+		systemResult += "," + systemPromptBlock
 	}
 	systemResult += "]"
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
 
 	// Collect user system instructions and prepend to first user message
 	if !strictMode {
-		var userSystemParts []string
-		if system.IsArray() {
-			system.ForEach(func(_, part gjson.Result) bool {
-				if part.Get("type").String() == "text" {
-					txt := part.Get("text").String()
-					if strings.TrimSpace(txt) != "" {
-						userSystemParts = append(userSystemParts, txt)
-					}
-				}
-				return true
-			})
-		} else if system.Type == gjson.String && strings.TrimSpace(system.String()) != "" {
-			userSystemParts = append(userSystemParts, system.String())
-		}
-		if fullSystemPrompt {
-			userSystemParts = dedupeClaudeCodeStaticPromptParts(userSystemParts)
-		}
-
-		if len(userSystemParts) > 0 {
-			combined := strings.Join(userSystemParts, "\n\n")
+		if len(forwardedSystemParts) > 0 {
+			combined := strings.Join(forwardedSystemParts, "\n\n")
 			if oauthMode {
 				combined = sanitizeForwardedSystemPrompt(combined)
 			}
@@ -2090,15 +2083,35 @@ func checkSystemInstructionsWithFullSystemPrompt(payload []byte, strictMode bool
 	return payload
 }
 
-func dedupeClaudeCodeStaticPromptParts(parts []string) []string {
-	deduped := make([]string, 0, len(parts))
+func claudePlainSystemTextParts(system gjson.Result) []string {
+	var parts []string
+	if system.IsArray() {
+		system.ForEach(func(_, part gjson.Result) bool {
+			if part.Get("type").String() == "text" {
+				txt := part.Get("text").String()
+				if strings.TrimSpace(txt) != "" {
+					parts = append(parts, txt)
+				}
+			}
+			return true
+		})
+	} else if system.Type == gjson.String && strings.TrimSpace(system.String()) != "" {
+		parts = append(parts, system.String())
+	}
+	return parts
+}
+
+func splitClaudeCodeSystemPromptParts(parts []string) (dynamicSystemPromptParts []claudeCodeDynamicSection, forwardedSystemParts []string) {
+	var dynamicSections []claudeCodeDynamicSection
 	for _, part := range parts {
 		cleaned := removeClaudeCodeStaticPromptDuplicates(part)
-		if strings.TrimSpace(cleaned) != "" {
-			deduped = append(deduped, cleaned)
+		partDynamicSections, remaining := extractClaudeCodeDynamicPromptSections(cleaned)
+		dynamicSections = append(dynamicSections, partDynamicSections...)
+		if strings.TrimSpace(remaining) != "" {
+			forwardedSystemParts = append(forwardedSystemParts, remaining)
 		}
 	}
-	return deduped
+	return dynamicSections, forwardedSystemParts
 }
 
 func removeClaudeCodeStaticPromptDuplicates(text string) string {
@@ -2115,6 +2128,101 @@ func removeClaudeCodeStaticPromptDuplicates(text string) string {
 		return text
 	}
 	return strings.TrimSpace(cleaned)
+}
+
+type claudeCodeDynamicSection struct {
+	heading string
+	text    string
+}
+
+func extractClaudeCodeDynamicPromptSections(text string) ([]claudeCodeDynamicSection, string) {
+	normalized := normalizeClaudePromptLineEndings(text)
+	ranges := claudeCodeDynamicSectionRanges(normalized)
+	if len(ranges) == 0 {
+		return nil, text
+	}
+
+	sections := make([]claudeCodeDynamicSection, 0, len(ranges))
+	var remaining strings.Builder
+	cursor := 0
+	for i, sectionRange := range ranges {
+		if sectionRange.start > cursor {
+			remaining.WriteString(normalized[cursor:sectionRange.start])
+		}
+		end := len(normalized)
+		if i+1 < len(ranges) {
+			end = ranges[i+1].start
+		}
+		sectionText := strings.TrimSpace(normalized[sectionRange.start:end])
+		if sectionText != "" {
+			sections = append(sections, claudeCodeDynamicSection{
+				heading: sectionRange.heading,
+				text:    sectionText,
+			})
+		}
+		cursor = end
+	}
+	if cursor < len(normalized) {
+		remaining.WriteString(normalized[cursor:])
+	}
+	return sections, strings.TrimSpace(remaining.String())
+}
+
+type claudeCodeDynamicSectionRange struct {
+	heading string
+	start   int
+}
+
+func claudeCodeDynamicSectionRanges(text string) []claudeCodeDynamicSectionRange {
+	var ranges []claudeCodeDynamicSectionRange
+	offset := 0
+	for offset < len(text) {
+		lineStart := offset
+		nextLine := strings.IndexByte(text[offset:], '\n')
+		lineEnd := len(text)
+		if nextLine >= 0 {
+			lineEnd = offset + nextLine
+			offset = lineEnd + 1
+		} else {
+			offset = len(text)
+		}
+		if heading := claudeCodeDynamicPromptHeading(text[lineStart:lineEnd]); heading != "" {
+			ranges = append(ranges, claudeCodeDynamicSectionRange{heading: heading, start: lineStart})
+		}
+	}
+	return ranges
+}
+
+func claudeCodeDynamicPromptHeading(line string) string {
+	trimmed := strings.TrimSpace(line)
+	for _, heading := range claudeCodeDynamicPromptHeadingOrder() {
+		if trimmed == heading {
+			return heading
+		}
+	}
+	return ""
+}
+
+func claudeCodeDynamicSectionTexts(sections []claudeCodeDynamicSection) []string {
+	if len(sections) == 0 {
+		return nil
+	}
+	texts := make([]string, 0, len(sections))
+	for _, section := range sections {
+		if strings.TrimSpace(section.text) != "" {
+			texts = append(texts, section.text)
+		}
+	}
+	return texts
+}
+
+func claudeCodeDynamicPromptHeadingOrder() []string {
+	return []string{
+		"# Session-specific guidance",
+		"# auto memory",
+		"# Environment",
+		"# Context management",
+	}
 }
 
 func removeClaudeCodeStaticPromptSnippet(text, snippet string) string {
@@ -2290,7 +2398,16 @@ func applyCloaking(ctx context.Context, cfg *config.Config, auth *cliproxyauth.A
 		billingVersion := helps.DefaultClaudeVersion(cfg)
 		entrypoint := parseEntrypointFromUA(clientUserAgent)
 		workload := getWorkloadFromContext(ctx)
-		payload = checkSystemInstructionsWithFullSystemPrompt(payload, strictMode, useCCHSigning, oauthToken, billingVersion, entrypoint, workload, fullSystemPrompt)
+		payload = checkSystemInstructionsWithFullSystemPrompt(
+			payload,
+			strictMode,
+			useCCHSigning,
+			oauthToken,
+			billingVersion,
+			entrypoint,
+			workload,
+			fullSystemPrompt,
+		)
 	}
 
 	// Inject fake user ID

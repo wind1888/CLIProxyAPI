@@ -2677,6 +2677,73 @@ func TestCheckSystemInstructionsWithFullSystemPrompt_DedupesStaticSectionsAndKee
 	}
 }
 
+func TestCheckSystemInstructionsWithFullSystemPrompt_MergesClientDynamicSectionsIntoSystemPrompt(t *testing.T) {
+	dynamicPrompt := "# Session-specific guidance\n- Use /help for help when asked.\n\n" +
+		"# auto memory\n- Remember client-side preference.\n\n" +
+		"# Environment\nYou have been invoked in the following environment: \n- Primary working directory: /client/project\n- Platform: darwin\n\n" +
+		"# Context management\n- The conversation has unlimited context through automatic summarization."
+	clientSystem := helps.ClaudeCodeStaticSystemPrompt + "\n\n" + dynamicPrompt
+	payload := []byte(`{"system":[{"type":"text","text":""}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
+	payload, _ = sjson.SetBytes(payload, "system.0.text", clientSystem)
+
+	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", true)
+
+	if got := gjson.GetBytes(out, "system.2.text").String(); got != clientSystem {
+		t.Fatalf("system.2.text did not preserve official static+dynamic prompt:\nGOT:\n%s\nWANT:\n%s", got, clientSystem)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.#").Int(); got != 1 {
+		t.Fatalf("dynamic official prompt should not be forwarded as reminder, content count = %d: %s", got, gjson.GetBytes(out, "messages.0.content").Raw)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != "Reply only OK" {
+		t.Fatalf("original user text changed, got %q", got)
+	}
+}
+
+func TestCheckSystemInstructionsWithFullSystemPrompt_MovesDynamicSectionsAndKeepsCustomReminder(t *testing.T) {
+	clientDynamic := "# Environment\nYou have been invoked in the following environment: \n- Primary working directory: /client/project"
+	payload := []byte(`{"system":[{"type":"text","text":"请始终使用中文回答。"},{"type":"text","text":""}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
+	payload, _ = sjson.SetBytes(payload, "system.1.text", clientDynamic)
+
+	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", true)
+
+	systemPrompt := gjson.GetBytes(out, "system.2.text").String()
+	if !strings.Contains(systemPrompt, clientDynamic) {
+		t.Fatalf("client dynamic section was not merged into system.2: %q", systemPrompt)
+	}
+	forwarded := gjson.GetBytes(out, "messages.0.content.0.text").String()
+	if !strings.Contains(forwarded, "请始终使用中文回答。") {
+		t.Fatalf("custom client system text was not forwarded, got %q", forwarded)
+	}
+	if strings.Contains(forwarded, "# Environment") {
+		t.Fatalf("official dynamic section should not remain in forwarded reminder: %q", forwarded)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.1.text").String(); got != "Reply only OK" {
+		t.Fatalf("original user text changed, got %q", got)
+	}
+}
+
+func TestCheckSystemInstructionsWithFullSystemPrompt_PreservesClientDynamicSectionOrder(t *testing.T) {
+	environment := "# Environment\nYou have been invoked in the following environment: \n- Primary working directory: /client/project"
+	sessionGuidance := "# Session-specific guidance\n- Client session rule."
+	payload := []byte(`{"system":[{"type":"text","text":""}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
+	payload, _ = sjson.SetBytes(payload, "system.0.text", environment+"\n\n"+sessionGuidance)
+
+	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", true)
+
+	systemPrompt := gjson.GetBytes(out, "system.2.text").String()
+	sessionIdx := strings.Index(systemPrompt, "# Session-specific guidance")
+	environmentIdx := strings.Index(systemPrompt, "# Environment")
+	if sessionIdx < 0 || environmentIdx < 0 {
+		t.Fatalf("system.2 missing dynamic sections: %q", systemPrompt)
+	}
+	if environmentIdx > sessionIdx {
+		t.Fatalf("dynamic sections should preserve client order: environment=%d session=%d", environmentIdx, sessionIdx)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.#").Int(); got != 1 {
+		t.Fatalf("official dynamic sections should not be forwarded, content count = %d: %s", got, gjson.GetBytes(out, "messages.0.content").Raw)
+	}
+}
+
 func TestCheckSystemInstructionsWithFullSystemPrompt_KeepsSimilarButModifiedClientPrompt(t *testing.T) {
 	modifiedDoingTasks := strings.Replace(helps.ClaudeCodeDoingTasks, "The user will primarily request", "The customer will primarily request", 1)
 	payload := []byte(`{"system":[{"type":"text","text":""}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
@@ -2702,6 +2769,22 @@ func TestCheckSystemInstructionsWithFullSystemPrompt_DedupeDisabledForMinimalClo
 	forwarded := gjson.GetBytes(out, "messages.0.content.0.text").String()
 	if !strings.Contains(forwarded, "# Doing tasks") {
 		t.Fatalf("minimal cloak should keep client prompt unchanged, got %q", forwarded)
+	}
+}
+
+func TestCheckSystemInstructionsWithFullSystemPrompt_DynamicMergeDisabledForMinimalCloak(t *testing.T) {
+	clientDynamic := "# Environment\nYou have been invoked in the following environment: \n- Primary working directory: /client/project"
+	payload := []byte(`{"system":[{"type":"text","text":""}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
+	payload, _ = sjson.SetBytes(payload, "system.0.text", clientDynamic)
+
+	out := checkSystemInstructionsWithFullSystemPrompt(payload, false, false, false, "2.1.215", "sdk-cli", "", false)
+
+	if got := len(gjson.GetBytes(out, "system").Array()); got != 2 {
+		t.Fatalf("system block count = %d, want 2: %s", got, gjson.GetBytes(out, "system").Raw)
+	}
+	forwarded := gjson.GetBytes(out, "messages.0.content.0.text").String()
+	if !strings.Contains(forwarded, "# Environment") {
+		t.Fatalf("minimal cloak should keep client dynamic prompt in reminder, got %q", forwarded)
 	}
 }
 
