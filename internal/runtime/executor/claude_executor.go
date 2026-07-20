@@ -1953,11 +1953,8 @@ func checkSystemInstructionsWithMode(payload []byte, strictMode bool) []byte {
 // checkSystemInstructionsWithSigningMode injects Claude Code-style system blocks:
 //
 //	system[0]: billing header (no cache_control)
-//	system[1]: agent identifier (cache_control ephemeral, scope=org)
-//	system[2]: core intro prompt (cache_control ephemeral, scope=global)
-//	system[3]: system instructions (no cache_control)
-//	system[4]: doing tasks (no cache_control)
-//	system[5]: user system messages moved to first user message
+//	system[1]: agent identifier (no cache_control)
+//	client system messages: moved to the first user message when strict mode is disabled
 func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string) []byte {
 	system := gjson.GetBytes(payload, "system")
 
@@ -1990,16 +1987,7 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	// scope='org' in the API request. Only scope='global' is sent explicitly.
 	// The system prompt prefix block is sent without cache_control.
 	agentBlock := buildTextBlock("You are Claude Code, Anthropic's official CLI for Claude.", nil)
-	staticPrompt := strings.Join([]string{
-		helps.ClaudeCodeIntro,
-		helps.ClaudeCodeSystem,
-		helps.ClaudeCodeDoingTasks,
-		helps.ClaudeCodeToneAndStyle,
-		helps.ClaudeCodeOutputEfficiency,
-	}, "\n\n")
-	staticBlock := buildTextBlock(staticPrompt, nil)
-
-	systemResult := "[" + billingBlock + "," + agentBlock + "," + staticBlock + "]"
+	systemResult := "[" + billingBlock + "," + agentBlock + "]"
 	payload, _ = sjson.SetRawBytes(payload, "system", []byte(systemResult))
 
 	// Collect user system instructions and prepend to first user message
@@ -2008,15 +1996,15 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 		if system.IsArray() {
 			system.ForEach(func(_, part gjson.Result) bool {
 				if part.Get("type").String() == "text" {
-					txt := strings.TrimSpace(part.Get("text").String())
-					if txt != "" {
+					txt := part.Get("text").String()
+					if strings.TrimSpace(txt) != "" {
 						userSystemParts = append(userSystemParts, txt)
 					}
 				}
 				return true
 			})
 		} else if system.Type == gjson.String && strings.TrimSpace(system.String()) != "" {
-			userSystemParts = append(userSystemParts, strings.TrimSpace(system.String()))
+			userSystemParts = append(userSystemParts, system.String())
 		}
 
 		if len(userSystemParts) > 0 {
@@ -2033,17 +2021,10 @@ func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, exp
 	return payload
 }
 
-// sanitizeForwardedSystemPrompt reduces forwarded third-party system context to a
-// tiny neutral reminder for Claude OAuth cloaking. The goal is to preserve only
-// the minimum tool/task guidance while removing virtually all client-specific
-// prompt structure that Anthropic may classify as third-party agent traffic.
+// sanitizeForwardedSystemPrompt keeps the client-provided system context intact
+// when it is moved into the first user message for Claude OAuth cloaking.
 func sanitizeForwardedSystemPrompt(text string) string {
-	if strings.TrimSpace(text) == "" {
-		return ""
-	}
-	return strings.TrimSpace(`Use the available tools when needed to help with software engineering tasks.
-Keep responses concise and focused on the user's request.
-Prefer acting on the user's task over describing product-specific workflows.`)
+	return text
 }
 
 // buildTextBlock constructs a JSON text block object with proper escaping.
