@@ -442,9 +442,10 @@ type CloakConfig struct {
 	// When false, a fresh random user_id is generated for every request.
 	CacheUserID *bool `yaml:"cache-user-id,omitempty" json:"cache-user-id,omitempty"`
 
-	// FullSystemPrompt controls whether cloaking appends the full Claude Code
-	// static system prompt after the billing and identity system blocks.
-	// When nil or true, cloaking appends it; set false for minimal billing + identity.
+	// FullSystemPrompt controls whether cloaking appends Claude Code's static
+	// system prompt plus client-provided official dynamic sections after the
+	// billing and identity system blocks. When nil or true, cloaking appends it;
+	// set false for minimal billing + identity.
 	FullSystemPrompt *bool `yaml:"full-system-prompt,omitempty" json:"full-system-prompt,omitempty"`
 }
 

@@ -319,7 +319,7 @@ nonstream-keepalive-interval: 0
 #       # "disable-claude-cloak-mode: true" disables cloaking for all Claude credentials at once.
 #       strict-mode: false           # false (default): prepend Claude Code prompt to user system messages
 #                                    # true: strip all user system messages, keep only Claude Code prompt
-#       full-system-prompt: true     # true (default): append Claude Code's full static prompt as system[2]
+#       full-system-prompt: true     # true (default): append Claude Code static prompt plus client dynamic sections as system[2]
 #                                    # false: minimal cloak with billing + identity only
 #       sensitive-words:             # optional: words to obfuscate with zero-width characters
 #         - "API"
@@ -335,9 +335,9 @@ nonstream-keepalive-interval: 0
 # while user-agent/package-version/runtime-version seed a software fingerprint that can
 # still upgrade to newer official Claude client versions.
 # claude-header-defaults:
-#   user-agent: "claude-cli/2.1.44 (external, sdk-cli)"
-#   package-version: "0.74.0"
-#   runtime-version: "v24.3.0"
+#   user-agent: "claude-cli/2.1.215 (external, cli)"
+#   package-version: "0.94.0"
+#   runtime-version: "v26.3.0"
 #   os: "MacOS"
 #   arch: "arm64"
 #   timeout: "600"

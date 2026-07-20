@@ -1203,10 +1203,9 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	r.Header.Set("Anthropic-Beta", baseBetas)
 
 	misc.EnsureHeader(r.Header, incomingHeaders, "Anthropic-Version", "2023-06-01")
-	// Only set browser access header for API key mode; real Claude Code CLI does not send it.
-	if useAPIKey {
-		misc.EnsureHeader(r.Header, incomingHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
-	}
+	// Real Claude Code CLI does not send the browser-access opt-in by default.
+	// Preserve it only when the incoming client explicitly provided it.
+	misc.EnsureHeader(r.Header, incomingHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "")
 	misc.EnsureHeader(r.Header, incomingHeaders, "X-App", "cli")
 	// Values below match Claude Code 2.1.215 / @anthropic-ai/sdk 0.94.0 (updated 2026-07-19).
 	misc.EnsureHeader(r.Header, incomingHeaders, "X-Stainless-Retry-Count", "0")
@@ -1224,16 +1223,8 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		misc.EnsureHeader(r.Header, incomingHeaders, "x-client-request-id", uuid.New().String())
 	}
 	r.Header.Set("Connection", "keep-alive")
-	if stream {
-		r.Header.Set("Accept", "text/event-stream")
-		// SSE streams must not be compressed: the downstream scanner reads
-		// line-delimited text and cannot parse compressed bytes.  Using
-		// "identity" tells the upstream to send an uncompressed stream.
-		r.Header.Set("Accept-Encoding", "identity")
-	} else {
-		r.Header.Set("Accept", "application/json")
-		r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
-	}
+	r.Header.Set("Accept", "application/json")
+	r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
 	// Legacy mode keeps OS/Arch runtime-derived; stabilized mode pins OS/Arch
 	// to the configured baseline while still allowing newer official
 	// User-Agent/package/runtime tuples to upgrade the software fingerprint.
@@ -1247,12 +1238,6 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
-	// Re-enforce Accept-Encoding: identity after ApplyCustomHeadersFromAttrs, which
-	// may override it with a user-configured value.  Compressed SSE breaks the line
-	// scanner regardless of user preference, so this is non-negotiable for streams.
-	if stream {
-		r.Header.Set("Accept-Encoding", "identity")
-	}
 	return nil
 }
 
@@ -2011,17 +1996,35 @@ func claudeFirstUserText(payload []byte) string {
 			return false
 		}
 		if content.IsArray() {
+			fallbackText := ""
 			content.ForEach(func(_, part gjson.Result) bool {
 				if part.Get("type").String() == "text" {
-					firstText = part.Get("text").String()
+					txt := part.Get("text").String()
+					if strings.TrimSpace(txt) == "" {
+						return true
+					}
+					if fallbackText == "" {
+						fallbackText = txt
+					}
+					if isClaudeSystemReminderText(txt) {
+						return true
+					}
+					firstText = txt
 					return false
 				}
 				return true
 			})
+			if firstText == "" {
+				firstText = fallbackText
+			}
 		}
 		return firstText == ""
 	})
 	return firstText
+}
+
+func isClaudeSystemReminderText(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), "<system-reminder>")
 }
 
 func checkSystemInstructionsWithSigningMode(payload []byte, strictMode bool, experimentalCCHSigning bool, oauthMode bool, version, entrypoint, workload string) []byte {

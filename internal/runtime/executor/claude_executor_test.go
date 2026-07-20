@@ -112,6 +112,47 @@ func TestApplyClaudeHeaders_UsesConfiguredBaselineFingerprint(t *testing.T) {
 	}
 }
 
+func TestApplyClaudeHeaders_DoesNotDefaultDangerousDirectBrowserAccess(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+
+	req := newClaudeHeaderTestRequest(t, nil)
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"api_key": "key-danger-default",
+		},
+	}
+
+	if err := applyClaudeHeaders(req, auth, "key-danger-default", false, nil, &config.Config{}, nil); err != nil {
+		t.Fatalf("applyClaudeHeaders() error = %v", err)
+	}
+
+	if got := req.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "" {
+		t.Fatalf("Anthropic-Dangerous-Direct-Browser-Access = %q, want empty", got)
+	}
+}
+
+func TestApplyClaudeHeaders_PreservesExplicitDangerousDirectBrowserAccess(t *testing.T) {
+	resetClaudeDeviceProfileCache()
+
+	incoming := http.Header{
+		"Anthropic-Dangerous-Direct-Browser-Access": []string{"true"},
+	}
+	req := newClaudeHeaderTestRequest(t, incoming)
+	auth := &cliproxyauth.Auth{
+		Attributes: map[string]string{
+			"api_key": "key-danger-explicit",
+		},
+	}
+
+	if err := applyClaudeHeaders(req, auth, "key-danger-explicit", false, nil, &config.Config{}, incoming); err != nil {
+		t.Fatalf("applyClaudeHeaders() error = %v", err)
+	}
+
+	if got := req.Header.Get("Anthropic-Dangerous-Direct-Browser-Access"); got != "true" {
+		t.Fatalf("Anthropic-Dangerous-Direct-Browser-Access = %q, want true", got)
+	}
+}
+
 func TestApplyClaudeHeaders_TracksHighestClaudeCLIFingerprint(t *testing.T) {
 	resetClaudeDeviceProfileCache()
 	stabilize := true
@@ -2001,10 +2042,7 @@ func TestEnsureModelMaxTokens_SkipsUnregisteredModel(t *testing.T) {
 	}
 }
 
-// TestClaudeExecutor_ExecuteStream_SetsIdentityAcceptEncoding verifies that streaming
-// requests use Accept-Encoding: identity so the upstream cannot respond with a
-// compressed SSE body that would silently break the line scanner.
-func TestClaudeExecutor_ExecuteStream_SetsIdentityAcceptEncoding(t *testing.T) {
+func TestClaudeExecutor_ExecuteStream_UsesClaudeCodeAcceptHeaders(t *testing.T) {
 	var gotEncoding, gotAccept string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotEncoding = r.Header.Get("Accept-Encoding")
@@ -2036,11 +2074,11 @@ func TestClaudeExecutor_ExecuteStream_SetsIdentityAcceptEncoding(t *testing.T) {
 		}
 	}
 
-	if gotEncoding != "identity" {
-		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "identity")
+	if gotEncoding != "gzip, deflate, br, zstd" {
+		t.Errorf("Accept-Encoding = %q, want %q", gotEncoding, "gzip, deflate, br, zstd")
 	}
-	if gotAccept != "text/event-stream" {
-		t.Errorf("Accept = %q, want %q", gotAccept, "text/event-stream")
+	if gotAccept != "application/json" {
+		t.Errorf("Accept = %q, want %q", gotAccept, "application/json")
 	}
 }
 
@@ -2341,9 +2379,7 @@ func TestClaudeExecutor_ExecuteStream_GzipErrorBodyNoContentEncodingHeader(t *te
 	}
 }
 
-// TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity verifies that the
-// streaming executor enforces Accept-Encoding: identity regardless of auth.Attributes override.
-func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity(t *testing.T) {
+func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideStillApplies(t *testing.T) {
 	var gotEncoding string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotEncoding = r.Header.Get("Accept-Encoding")
@@ -2356,7 +2392,7 @@ func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
 		"api_key":                "key-123",
 		"base_url":               server.URL,
-		"header:Accept-Encoding": "gzip, deflate, br, zstd",
+		"header:Accept-Encoding": "identity",
 	}}
 	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`)
 
@@ -2376,7 +2412,7 @@ func TestClaudeExecutor_ExecuteStream_AcceptEncodingOverrideCannotBypassIdentity
 	}
 
 	if gotEncoding != "identity" {
-		t.Errorf("Accept-Encoding = %q; stream path must enforce identity regardless of auth.Attributes override", gotEncoding)
+		t.Errorf("Accept-Encoding = %q, want explicit custom override identity", gotEncoding)
 	}
 }
 
@@ -2567,6 +2603,16 @@ func TestClaudeExecutor_OAuthDefaultFullCloakPreservesClientContent(t *testing.T
 
 func TestCheckSystemInstructionsWithSigningMode_UsesClaude215UserFingerprint(t *testing.T) {
 	payload := []byte(`{"system":[{"type":"text","text":"Different system text"}],"messages":[{"role":"user","content":[{"type":"text","text":"Reply only OK"}]}]}`)
+
+	out := checkSystemInstructionsWithSigningMode(payload, true, false, false, "2.1.215", "sdk-cli", "")
+
+	if got, want := gjson.GetBytes(out, "system.0.text").String(), "x-anthropic-billing-header: cc_version=2.1.215.d68; cc_entrypoint=sdk-cli;"; got != want {
+		t.Fatalf("billing header = %q, want %q", got, want)
+	}
+}
+
+func TestCheckSystemInstructionsWithSigningMode_UserFingerprintSkipsSystemReminders(t *testing.T) {
+	payload := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>\nAvailable agent types for the Agent tool.\n</system-reminder>"},{"type":"text","text":"<system-reminder>\nCurrent date context.\n</system-reminder>"},{"type":"text","text":"Reply only OK"}]}]}`)
 
 	out := checkSystemInstructionsWithSigningMode(payload, true, false, false, "2.1.215", "sdk-cli", "")
 
