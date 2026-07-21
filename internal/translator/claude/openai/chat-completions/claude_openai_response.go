@@ -50,16 +50,16 @@ func (u *claudeUsageTokens) Merge(usage gjson.Result) {
 		return
 	}
 	u.HasUsage = true
-	if inputTokens := usage.Get("input_tokens"); inputTokens.Exists() {
+	if inputTokens := usage.Get("input_tokens"); inputTokens.Type == gjson.Number {
 		u.InputTokens = inputTokens.Int()
 	}
-	if outputTokens := usage.Get("output_tokens"); outputTokens.Exists() {
+	if outputTokens := usage.Get("output_tokens"); outputTokens.Type == gjson.Number {
 		u.OutputTokens = outputTokens.Int()
 	}
-	if cacheCreationInputTokens := usage.Get("cache_creation_input_tokens"); cacheCreationInputTokens.Exists() {
+	if cacheCreationInputTokens := usage.Get("cache_creation_input_tokens"); cacheCreationInputTokens.Type == gjson.Number {
 		u.CacheCreationInputTokens = cacheCreationInputTokens.Int()
 	}
-	if cacheReadInputTokens := usage.Get("cache_read_input_tokens"); cacheReadInputTokens.Exists() {
+	if cacheReadInputTokens := usage.Get("cache_read_input_tokens"); cacheReadInputTokens.Type == gjson.Number {
 		u.CacheReadInputTokens = cacheReadInputTokens.Int()
 	}
 }
@@ -232,7 +232,7 @@ func ConvertClaudeResponseToOpenAI(_ context.Context, modelName string, original
 	case "message_delta":
 		// Handle message-level changes including stop reason and usage
 		if delta := root.Get("delta"); delta.Exists() {
-			if stopReason := delta.Get("stop_reason"); stopReason.Exists() {
+			if stopReason := delta.Get("stop_reason"); stopReason.Type == gjson.String && strings.TrimSpace(stopReason.String()) != "" {
 				(*param).(*ConvertAnthropicResponseToOpenAIParams).FinishReason = mapAnthropicStopReasonToOpenAI(stopReason.String())
 				template, _ = sjson.SetBytes(template, "choices.0.finish_reason", (*param).(*ConvertAnthropicResponseToOpenAIParams).FinishReason)
 			}
@@ -394,7 +394,7 @@ func ConvertClaudeResponseToOpenAINonStream(_ context.Context, _ string, origina
 		case "message_delta":
 			// Extract stop reason and output token count when message ends
 			if delta := root.Get("delta"); delta.Exists() {
-				if sr := delta.Get("stop_reason"); sr.Exists() {
+				if sr := delta.Get("stop_reason"); sr.Type == gjson.String && strings.TrimSpace(sr.String()) != "" {
 					stopReason = sr.String()
 				}
 			}

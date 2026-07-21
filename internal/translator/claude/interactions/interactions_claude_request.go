@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -14,6 +16,7 @@ func ConvertInteractionsRequestToClaude(modelName string, inputRawJSON []byte, s
 	root := gjson.ParseBytes(inputRawJSON)
 	out := []byte(`{"model":"","max_tokens":32000,"messages":[]}`)
 	out, _ = sjson.SetBytes(out, "model", modelName)
+	out, _ = sjson.SetBytes(out, "max_tokens", registry.ClaudeCodeDefaultMaxTokens(modelName))
 	if stream || root.Get("stream").Bool() {
 		out, _ = sjson.SetBytes(out, "stream", true)
 	}
@@ -21,6 +24,7 @@ func ConvertInteractionsRequestToClaude(modelName string, inputRawJSON []byte, s
 	out = copyInteractionsGenerationConfigToClaude(out, root)
 	out = appendInteractionsInputToClaudeMessages(out, root.Get("input"))
 	out = copyInteractionsToolsToClaude(out, root)
+	out = copyInteractionsParallelToolUseToClaude(out, root)
 	return out
 }
 
@@ -325,17 +329,22 @@ func appendInteractionsClaudeTool(tools []byte, tool gjson.Result) []byte {
 	if name == "" {
 		return tools
 	}
-	converted := []byte(`{"name":"","input_schema":{}}`)
+	converted := []byte(`{"name":"","input_schema":{"type":"object","properties":{}}}`)
 	converted, _ = sjson.SetBytes(converted, "name", name)
 	if desc := tool.Get("description"); desc.Exists() {
 		converted, _ = sjson.SetBytes(converted, "description", desc.String())
 	} else if desc := tool.Get("function.description"); desc.Exists() {
 		converted, _ = sjson.SetBytes(converted, "description", desc.String())
 	}
-	params := firstClaudeInteractionsExisting(tool, "parameters", "parametersJsonSchema", "parameters_json_schema", "input_schema")
-	if params.Exists() && params.IsObject() {
-		converted, _ = sjson.SetRawBytes(converted, "input_schema", []byte(params.Raw))
+	strict := tool.Get("strict")
+	if !strict.Exists() {
+		strict = tool.Get("function.strict")
 	}
+	if strict.Type == gjson.True || strict.Type == gjson.False {
+		converted, _ = sjson.SetBytes(converted, "strict", strict.Bool())
+	}
+	params := firstClaudeInteractionsExisting(tool, "parameters", "parametersJsonSchema", "parameters_json_schema", "input_schema")
+	converted, _ = sjson.SetRawBytes(converted, "input_schema", translatorcommon.NormalizeClaudeToolInputSchema(params))
 	tools, _ = sjson.SetRawBytes(tools, "-1", converted)
 	return tools
 }
@@ -347,6 +356,8 @@ func copyInteractionsToolChoiceToClaude(out []byte, toolChoice gjson.Result) []b
 	switch toolChoice.Type {
 	case gjson.String:
 		switch strings.ToLower(strings.TrimSpace(toolChoice.String())) {
+		case "none":
+			out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"none"}`))
 		case "auto":
 			out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"auto"}`))
 		case "required", "any":
@@ -355,6 +366,8 @@ func copyInteractionsToolChoiceToClaude(out []byte, toolChoice gjson.Result) []b
 	case gjson.JSON:
 		toolType := strings.ToLower(strings.TrimSpace(toolChoice.Get("type").String()))
 		switch toolType {
+		case "none":
+			out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"none"}`))
 		case "auto":
 			out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"auto"}`))
 		case "required", "any":
@@ -370,6 +383,22 @@ func copyInteractionsToolChoiceToClaude(out []byte, toolChoice gjson.Result) []b
 				out, _ = sjson.SetRawBytes(out, "tool_choice", choice)
 			}
 		}
+	}
+	return out
+}
+
+func copyInteractionsParallelToolUseToClaude(out []byte, root gjson.Result) []byte {
+	parallel := firstClaudeInteractionsExisting(root, "parallel_tool_calls", "parallelToolCalls", "generation_config.parallel_tool_calls", "generationConfig.parallelToolCalls")
+	if parallel.Type != gjson.False || len(gjson.GetBytes(out, "tools").Array()) == 0 {
+		return out
+	}
+	choiceType := gjson.GetBytes(out, "tool_choice.type").String()
+	if choiceType == "" {
+		out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"auto"}`))
+		choiceType = "auto"
+	}
+	if choiceType != "none" {
+		out, _ = sjson.SetBytes(out, "tool_choice.disable_parallel_tool_use", true)
 	}
 	return out
 }

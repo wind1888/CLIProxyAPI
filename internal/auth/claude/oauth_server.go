@@ -22,16 +22,30 @@ import (
 type OAuthServer struct {
 	// server is the underlying HTTP server instance
 	server *http.Server
+	// listener is bound synchronously so port 0 can resolve to an available loopback port.
+	listener net.Listener
 	// port is the port number on which the server listens
 	port int
 	// resultChan is a channel for sending OAuth results
 	resultChan chan *OAuthResult
 	// errorChan is a channel for sending OAuth errors
 	errorChan chan error
+	// completionChan releases the held callback response after token exchange.
+	completionChan chan oauthCallbackCompletion
+	// expectedState is the state generated for this OAuth attempt.
+	expectedState string
+	// pendingResponse reports whether a valid callback is waiting for exchange.
+	pendingResponse bool
+	// successURL is selected from the token response scope before completion.
+	successURL string
 	// mu is a mutex for protecting server state
 	mu sync.Mutex
 	// running indicates whether the server is currently running
 	running bool
+}
+
+type oauthCallbackCompletion struct {
+	err error
 }
 
 // OAuthResult contains the result of the OAuth callback.
@@ -57,14 +71,16 @@ type OAuthResult struct {
 //   - *OAuthServer: A new OAuthServer instance
 func NewOAuthServer(port int) *OAuthServer {
 	return &OAuthServer{
-		port:       port,
-		resultChan: make(chan *OAuthResult, 1),
-		errorChan:  make(chan error, 1),
+		port:           port,
+		resultChan:     make(chan *OAuthResult, 1),
+		errorChan:      make(chan error, 1),
+		completionChan: make(chan oauthCallbackCompletion, 1),
+		successURL:     OAuthSuccessURL,
 	}
 }
 
 // Start starts the OAuth callback server.
-// It sets up the HTTP handlers for the callback and success endpoints,
+// It sets up the official callback endpoint,
 // and begins listening on the specified port.
 //
 // Returns:
@@ -77,33 +93,43 @@ func (s *OAuthServer) Start() error {
 		return fmt.Errorf("server is already running")
 	}
 
-	// Check if port is available
-	if !s.isPortAvailable() {
-		return fmt.Errorf("port %d is already in use", s.port)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/callback" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		s.handleCallback(w, r)
+	})
+
+	listener, errListen := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", s.port))
+	if errListen != nil {
+		return fmt.Errorf("listen on Claude OAuth loopback port %d: %w", s.port, errListen)
 	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/callback", s.handleCallback)
-	mux.HandleFunc("/success", s.handleSuccess)
-
+	tcpAddr, okTCP := listener.Addr().(*net.TCPAddr)
+	if !okTCP || tcpAddr.Port <= 0 {
+		_ = listener.Close()
+		return fmt.Errorf("resolve Claude OAuth loopback port")
+	}
+	s.port = tcpAddr.Port
+	s.listener = listener
 	s.server = &http.Server{
-		Addr:         fmt.Sprintf(":%d", s.port),
-		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		Addr:        fmt.Sprintf("127.0.0.1:%d", s.port),
+		Handler:     handler,
+		ReadTimeout: 10 * time.Second,
+		// Token exchange plus the best-effort profile lookup can exceed 45 seconds.
+		// Keep the browser response open long enough for the complete OAuth path.
+		WriteTimeout: 75 * time.Second,
 	}
+	server := s.server
 
 	s.running = true
 
 	// Start server in goroutine
 	go func() {
-		if err := s.server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			s.errorChan <- fmt.Errorf("server failed to start: %w", err)
 		}
 	}()
-
-	// Give server a moment to start
-	time.Sleep(100 * time.Millisecond)
 
 	return nil
 }
@@ -118,23 +144,21 @@ func (s *OAuthServer) Start() error {
 //   - error: An error if the server fails to stop gracefully
 func (s *OAuthServer) Stop(ctx context.Context) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if !s.running || s.server == nil {
+		s.mu.Unlock()
 		return nil
 	}
-
-	log.Debug("Stopping OAuth callback server")
-
-	// Create a context with timeout for shutdown
-	shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	err := s.server.Shutdown(shutdownCtx)
+	server := s.server
 	s.running = false
 	s.server = nil
+	s.listener = nil
+	s.pendingResponse = false
+	s.mu.Unlock()
 
-	return err
+	log.Debug("Stopping OAuth callback server")
+	shutdownCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return server.Shutdown(shutdownCtx)
 }
 
 // WaitForCallback waits for the OAuth callback with a timeout.
@@ -148,12 +172,27 @@ func (s *OAuthServer) Stop(ctx context.Context) error {
 //   - *OAuthResult: The OAuth result if successful
 //   - error: An error if the callback times out or an error occurs
 func (s *OAuthServer) WaitForCallback(timeout time.Duration) (*OAuthResult, error) {
+	return s.WaitForCallbackContext(context.Background(), timeout)
+}
+
+// WaitForCallbackContext waits for a callback while also honoring caller
+// cancellation. This prevents a canceled CLI login from waiting for the full
+// callback timeout.
+func (s *OAuthServer) WaitForCallbackContext(ctx context.Context, timeout time.Duration) (*OAuthResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
 	select {
 	case result := <-s.resultChan:
 		return result, nil
 	case err := <-s.errorChan:
 		return nil, err
-	case <-time.After(timeout):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
 		return nil, fmt.Errorf("timeout waiting for OAuth callback")
 	}
 }
@@ -168,114 +207,88 @@ func (s *OAuthServer) WaitForCallback(timeout time.Duration) (*OAuthResult, erro
 func (s *OAuthServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	log.Debug("Received OAuth callback")
 
-	// Validate request method
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Extract parameters
 	query := r.URL.Query()
 	code := query.Get("code")
 	state := query.Get("state")
-	errorParam := query.Get("error")
-
-	// Validate required parameters
-	if errorParam != "" {
-		log.Errorf("OAuth error received: %s", errorParam)
-		result := &OAuthResult{
-			Error: errorParam,
-		}
-		s.sendResult(result)
-		http.Error(w, fmt.Sprintf("OAuth error: %s", errorParam), http.StatusBadRequest)
-		return
-	}
 
 	if code == "" {
-		log.Error("No authorization code received")
-		result := &OAuthResult{
-			Error: "no_code",
-		}
-		s.sendResult(result)
-		http.Error(w, "No authorization code received", http.StatusBadRequest)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("Authorization code not found"))
+		s.sendError(fmt.Errorf("authorization code not found"))
 		return
 	}
 
-	if state == "" {
-		log.Error("No state parameter received")
-		result := &OAuthResult{
-			Error: "no_state",
-		}
-		s.sendResult(result)
-		http.Error(w, "No state parameter received", http.StatusBadRequest)
+	s.mu.Lock()
+	expectedState := s.expectedState
+	s.mu.Unlock()
+	if state == "" || expectedState == "" || state != expectedState {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("Invalid state parameter"))
+		s.sendError(fmt.Errorf("invalid state parameter"))
 		return
 	}
 
-	// Send successful result
 	result := &OAuthResult{
 		Code:  code,
 		State: state,
 	}
-	s.sendResult(result)
+	s.mu.Lock()
+	s.pendingResponse = true
+	s.mu.Unlock()
+	if !s.sendResult(result) {
+		s.mu.Lock()
+		s.pendingResponse = false
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusConflict)
+		return
+	}
+	// Stop accepting a competing callback as soon as this authorization code is
+	// resolved, while leaving the current HTTP response open for token exchange.
+	s.mu.Lock()
+	listener := s.listener
+	s.listener = nil
+	s.mu.Unlock()
+	if listener != nil {
+		_ = listener.Close()
+	}
 
-	// Redirect to success page
-	http.Redirect(w, r, "/success", http.StatusFound)
+	select {
+	case completion := <-s.completionChan:
+		s.mu.Lock()
+		s.pendingResponse = false
+		s.mu.Unlock()
+		if completion.err != nil {
+			// Claude Code's native listener releases a failed exchange through the
+			// same hosted completion page; the CLI itself reports the real error.
+			w.Header().Set("Location", OAuthSuccessURL)
+			w.Header().Set("Content-Length", "0")
+			w.WriteHeader(http.StatusFound)
+			return
+		}
+		s.mu.Lock()
+		successURL := s.successURL
+		s.mu.Unlock()
+		if strings.TrimSpace(successURL) == "" {
+			successURL = OAuthSuccessURL
+		}
+		w.Header().Set("Location", successURL)
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusFound)
+	case <-r.Context().Done():
+		s.mu.Lock()
+		s.pendingResponse = false
+		s.mu.Unlock()
+	}
 }
 
-// handleSuccess handles the success page endpoint.
-// It serves a user-friendly HTML page indicating that authentication was successful.
-//
-// Parameters:
-//   - w: The HTTP response writer
-//   - r: The HTTP request
-func (s *OAuthServer) handleSuccess(w http.ResponseWriter, r *http.Request) {
-	log.Debug("Serving success page")
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-
-	// Parse query parameters for customization
-	query := r.URL.Query()
-	setupRequired := query.Get("setup_required") == "true"
-	platformURL := query.Get("platform_url")
-	if platformURL == "" {
-		platformURL = "https://console.anthropic.com/"
+func (s *OAuthServer) sendError(err error) {
+	if err == nil {
+		return
 	}
-
-	// Generate success page HTML with dynamic content
-	successHTML := s.generateSuccessHTML(setupRequired, platformURL)
-
-	_, err := w.Write([]byte(successHTML))
-	if err != nil {
-		log.Errorf("Failed to write success page: %v", err)
+	select {
+	case s.errorChan <- err:
+	default:
 	}
-}
-
-// generateSuccessHTML creates the HTML content for the success page.
-// It customizes the page based on whether additional setup is required
-// and includes a link to the platform.
-//
-// Parameters:
-//   - setupRequired: Whether additional setup is required after authentication
-//   - platformURL: The URL to the platform for additional setup
-//
-// Returns:
-//   - string: The HTML content for the success page
-func (s *OAuthServer) generateSuccessHTML(setupRequired bool, platformURL string) string {
-	html := LoginSuccessHtml
-
-	// Replace platform URL placeholder
-	html = strings.Replace(html, "{{PLATFORM_URL}}", platformURL, -1)
-
-	// Add setup notice if required
-	if setupRequired {
-		setupNotice := strings.Replace(SetupNoticeHtml, "{{PLATFORM_URL}}", platformURL, -1)
-		html = strings.Replace(html, "{{SETUP_NOTICE}}", setupNotice, 1)
-	} else {
-		html = strings.Replace(html, "{{SETUP_NOTICE}}", "", 1)
-	}
-
-	return html
 }
 
 // sendResult sends the OAuth result to the waiting channel.
@@ -283,30 +296,15 @@ func (s *OAuthServer) generateSuccessHTML(setupRequired bool, platformURL string
 //
 // Parameters:
 //   - result: The OAuth result to send
-func (s *OAuthServer) sendResult(result *OAuthResult) {
+func (s *OAuthServer) sendResult(result *OAuthResult) bool {
 	select {
 	case s.resultChan <- result:
 		log.Debug("OAuth result sent to channel")
+		return true
 	default:
 		log.Warn("OAuth result channel is full, result dropped")
-	}
-}
-
-// isPortAvailable checks if the specified port is available.
-// It attempts to listen on the port to determine availability.
-//
-// Returns:
-//   - bool: True if the port is available, false otherwise
-func (s *OAuthServer) isPortAvailable() bool {
-	addr := fmt.Sprintf(":%d", s.port)
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
 		return false
 	}
-	defer func() {
-		_ = listener.Close()
-	}()
-	return true
 }
 
 // IsRunning returns whether the server is currently running.
@@ -317,4 +315,58 @@ func (s *OAuthServer) IsRunning() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.running
+}
+
+// Port returns the bound loopback port after Start succeeds.
+func (s *OAuthServer) Port() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.port
+}
+
+// RedirectURI returns the official localhost callback form for the bound port.
+func (s *OAuthServer) RedirectURI() string {
+	return fmt.Sprintf("http://localhost:%d/callback", s.Port())
+}
+
+// SetExpectedState configures the state that the loopback callback must carry.
+func (s *OAuthServer) SetExpectedState(state string) {
+	s.mu.Lock()
+	s.expectedState = state
+	s.mu.Unlock()
+}
+
+// SetSuccessURL selects the final redirect after token exchange.
+func (s *OAuthServer) SetSuccessURL(successURL string) {
+	s.mu.Lock()
+	s.successURL = strings.TrimSpace(successURL)
+	s.mu.Unlock()
+}
+
+// HasPendingResponse reports whether a valid callback is waiting for exchange.
+func (s *OAuthServer) HasPendingResponse() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.pendingResponse
+}
+
+// CompleteCallback releases a held callback after token exchange finishes.
+func (s *OAuthServer) CompleteCallback() {
+	select {
+	case s.completionChan <- oauthCallbackCompletion{}:
+	default:
+	}
+}
+
+// FailCallback releases a held browser response after a failed exchange. The
+// native Claude Code listener still redirects the browser to its hosted finish
+// page while the CLI reports the exchange error.
+func (s *OAuthServer) FailCallback(err error) {
+	if err == nil {
+		err = errors.New("token exchange failed")
+	}
+	select {
+	case s.completionChan <- oauthCallbackCompletion{err: err}:
+	default:
+	}
 }

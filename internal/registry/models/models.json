@@ -37,12 +37,13 @@
       "owned_by": "anthropic",
       "type": "claude",
       "display_name": "Claude 4.6 Sonnet",
-      "context_length": 200000,
-      "max_completion_tokens": 64000,
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
       "thinking": {
         "min": 1024,
         "max": 128000,
         "zero_allowed": true,
+        "dynamic_allowed": true,
         "levels": [
           "low",
           "medium",
@@ -65,6 +66,7 @@
         "min": 1024,
         "max": 128000,
         "zero_allowed": true,
+        "dynamic_allowed": true,
         "levels": [
           "low",
           "medium",
@@ -84,9 +86,8 @@
       "context_length": 1000000,
       "max_completion_tokens": 128000,
       "thinking": {
-        "min": 1024,
-        "max": 128000,
         "zero_allowed": true,
+        "dynamic_allowed": true,
         "levels": [
           "low",
           "medium",
@@ -107,9 +108,29 @@
       "context_length": 1000000,
       "max_completion_tokens": 128000,
       "thinking": {
-        "min": 1024,
-        "max": 128000,
         "zero_allowed": true,
+        "dynamic_allowed": true,
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      }
+    },
+    {
+      "id": "claude-mythos-5",
+      "object": "model",
+      "created": 1781049600,
+      "owned_by": "anthropic",
+      "type": "claude",
+      "display_name": "Claude Mythos 5",
+      "description": "Anthropic's Project Glasswing model with the same capabilities and API behavior as Claude Fable 5",
+      "context_length": 1000000,
+      "max_completion_tokens": 128000,
+      "thinking": {
+        "dynamic_allowed": true,
         "levels": [
           "low",
           "medium",
@@ -152,9 +173,7 @@
       "context_length": 1000000,
       "max_completion_tokens": 128000,
       "thinking": {
-        "min": 1024,
-        "max": 128000,
-        "zero_allowed": true,
+        "dynamic_allowed": true,
         "levels": [
           "low",
           "medium",

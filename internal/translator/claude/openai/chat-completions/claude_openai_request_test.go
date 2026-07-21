@@ -1,10 +1,28 @@
 package chat_completions
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestConvertOpenAIRequestToClaude_UsesNativeModelDefaultAndModernMaxField(t *testing.T) {
+	implicit := ConvertOpenAIRequestToClaude("claude-opus-4-8", []byte(`{
+		"messages":[{"role":"user","content":"hi"}]
+	}`), false)
+	if got := gjson.GetBytes(implicit, "max_tokens").Int(); got != 64000 {
+		t.Fatalf("implicit Opus 4.8 max_tokens = %d, want Claude Code default 64000: %s", got, implicit)
+	}
+
+	explicit := ConvertOpenAIRequestToClaude("claude-opus-4-8", []byte(`{
+		"max_completion_tokens":12345,
+		"messages":[{"role":"user","content":"hi"}]
+	}`), false)
+	if got := gjson.GetBytes(explicit, "max_tokens").Int(); got != 12345 {
+		t.Fatalf("max_completion_tokens mapping = %d, want 12345: %s", got, explicit)
+	}
+}
 
 func TestConvertOpenAIRequestToClaude_SanitizesToolCallIDsForClaude(t *testing.T) {
 	inputJSON := `{
@@ -298,8 +316,23 @@ func TestConvertOpenAIRequestToClaude_SystemOnlyInputKeepsFallbackUserMessage(t 
 	if got := messages[0].Get("content.0.type").String(); got != "text" {
 		t.Fatalf("Expected fallback content type %q, got %q", "text", got)
 	}
-	if got := messages[0].Get("content.0.text").String(); got != "" {
-		t.Fatalf("Expected fallback text %q, got %q", "", got)
+	if got := messages[0].Get("content.0.text").String(); got != "\u200b" {
+		t.Fatalf("Expected non-empty minimal fallback text, got %q", got)
+	}
+}
+
+func TestConvertOpenAIRequestToClaude_DropsEmptyTextBlocks(t *testing.T) {
+	out := ConvertOpenAIRequestToClaude("claude-sonnet-5", []byte(`{
+		"messages":[
+			{"role":"user","content":[{"type":"text","text":""},{"type":"text","text":"hello"}]},
+			{"role":"assistant","content":""}
+		]
+	}`), false)
+	if got := gjson.GetBytes(out, "messages.#").Int(); got != 1 {
+		t.Fatalf("messages count = %d, want only non-empty turn: %s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != "hello" {
+		t.Fatalf("remaining text = %q, want hello: %s", got, out)
 	}
 }
 
@@ -328,6 +361,114 @@ func TestConvertOpenAIRequestToClaude_PreservesContentPartCacheControl(t *testin
 	}
 	if got := resultJSON.Get("messages.0.content.0.text").String(); got != "cached prefix" {
 		t.Fatalf("content.0.text = %q, want %q", got, "cached prefix")
+	}
+}
+
+func TestConvertOpenAIRequestToClaude_MapsDeveloperMessagesToTopLevelSystem(t *testing.T) {
+	inputJSON := `{
+		"messages": [
+			{"role":"system","content":"base policy"},
+			{"role":"developer","content":[
+				{"type":"text","text":"cached developer policy"},
+				{"type":"text","text":"final developer policy"}
+			],"cache_control":{"type":"ephemeral"}},
+			{"role":"user","content":"hello"}
+		]
+	}`
+
+	out := ConvertOpenAIRequestToClaude("claude-sonnet-5", []byte(inputJSON), false)
+	root := gjson.ParseBytes(out)
+	if got := root.Get("system.#").Int(); got != 3 {
+		t.Fatalf("system block count = %d, want 3: %s", got, out)
+	}
+	for index, want := range []string{"base policy", "cached developer policy", "final developer policy"} {
+		if got := root.Get(fmt.Sprintf("system.%d.text", index)).String(); got != want {
+			t.Fatalf("system.%d.text = %q, want %q: %s", index, got, want, out)
+		}
+	}
+	if got := root.Get("system.2.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("message cache marker = %q, want ephemeral: %s", got, out)
+	}
+	if got := root.Get("messages.#").Int(); got != 1 {
+		t.Fatalf("messages count = %d, want only user turn: %s", got, out)
+	}
+}
+
+func TestConvertOpenAIRequestToClaude_PreservesSupportedMidConversationSystem(t *testing.T) {
+	request := []byte(`{"messages":[
+		{"role":"user","content":"question"},
+		{"role":"developer","content":"new operator rule"},
+		{"role":"assistant","content":"answer"}
+	]}`)
+
+	supported := ConvertOpenAIRequestToClaude("claude-fable-5", request, false)
+	for index, want := range []string{"user", "system", "assistant"} {
+		if got := gjson.GetBytes(supported, fmt.Sprintf("messages.%d.role", index)).String(); got != want {
+			t.Fatalf("supported messages.%d.role = %q, want %q: %s", index, got, want, supported)
+		}
+	}
+	if got := gjson.GetBytes(supported, "messages.1.content.0.text").String(); got != "new operator rule" {
+		t.Fatalf("mid-conversation system text = %q: %s", got, supported)
+	}
+	if gjson.GetBytes(supported, "system").Exists() {
+		t.Fatalf("supported mid-conversation rule was promoted: %s", supported)
+	}
+
+	unsupported := ConvertOpenAIRequestToClaude("claude-sonnet-5", request, false)
+	if got := gjson.GetBytes(unsupported, "system.0.text").String(); got != "new operator rule" {
+		t.Fatalf("Sonnet 5 fallback system text = %q: %s", got, unsupported)
+	}
+	if got := gjson.GetBytes(unsupported, "messages.#").Int(); got != 2 {
+		t.Fatalf("Sonnet 5 messages count = %d, want user+assistant: %s", got, unsupported)
+	}
+}
+
+func TestConvertOpenAIRequestToClaude_NormalizesToolInputSchema(t *testing.T) {
+	out := ConvertOpenAIRequestToClaude("claude-sonnet-5", []byte(`{
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[
+			{"type":"function","function":{"name":"empty"}},
+			{"type":"function","function":{"name":"exact","parameters":{"properties":{"id":{"const":9007199254740993}}}}}
+		]
+	}`), false)
+	root := gjson.ParseBytes(out)
+	for index := 0; index < 2; index++ {
+		if got := root.Get(fmt.Sprintf("tools.%d.input_schema.type", index)).String(); got != "object" {
+			t.Fatalf("tools.%d schema type = %q, want object: %s", index, got, out)
+		}
+	}
+	if got := root.Get("tools.1.input_schema.properties.id.const").Raw; got != "9007199254740993" {
+		t.Fatalf("large schema integer = %s, want exact 9007199254740993: %s", got, out)
+	}
+}
+
+func TestConvertOpenAIRequestToClaude_PreservesToolControlSemantics(t *testing.T) {
+	none := ConvertOpenAIRequestToClaude("claude-sonnet-5", []byte(`{
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"lookup","strict":true}}],
+		"tool_choice":"none",
+		"parallel_tool_calls":false
+	}`), false)
+	if got := gjson.GetBytes(none, "tools.0.strict").Bool(); !got {
+		t.Fatalf("strict tool flag was lost: %s", none)
+	}
+	if got := gjson.GetBytes(none, "tool_choice.type").String(); got != "none" {
+		t.Fatalf("tool_choice.type = %q, want none: %s", got, none)
+	}
+	if gjson.GetBytes(none, "tool_choice.disable_parallel_tool_use").Exists() {
+		t.Fatalf("none choice must not carry parallel-use flag: %s", none)
+	}
+
+	serial := ConvertOpenAIRequestToClaude("claude-sonnet-5", []byte(`{
+		"messages":[{"role":"user","content":"hi"}],
+		"tools":[{"type":"function","function":{"name":"lookup"}}],
+		"parallel_tool_calls":false
+	}`), false)
+	if got := gjson.GetBytes(serial, "tool_choice.type").String(); got != "auto" {
+		t.Fatalf("implicit tool_choice.type = %q, want auto: %s", got, serial)
+	}
+	if !gjson.GetBytes(serial, "tool_choice.disable_parallel_tool_use").Bool() {
+		t.Fatalf("parallel_tool_calls=false was lost: %s", serial)
 	}
 }
 

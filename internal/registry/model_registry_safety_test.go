@@ -175,3 +175,63 @@ func TestLookupModelInfoIncludesClaudeSonnet5(t *testing.T) {
 		}
 	}
 }
+
+func TestLookupModelInfoMatchesCurrentClaudeCodeCatalog(t *testing.T) {
+	sonnet46 := LookupModelInfo("claude-sonnet-4-6")
+	if sonnet46 == nil || sonnet46.ContextLength != 1000000 || sonnet46.MaxCompletionTokens != 128000 {
+		t.Fatalf("Claude Sonnet 4.6 limits = %+v, want 1M context and 128K output", sonnet46)
+	}
+	if sonnet46.Thinking == nil || !sonnet46.Thinking.DynamicAllowed || sonnet46.Thinking.Min != 1024 || sonnet46.Thinking.Max != 128000 {
+		t.Fatalf("Claude Sonnet 4.6 thinking = %+v, want hybrid adaptive/manual support", sonnet46.Thinking)
+	}
+
+	for _, modelID := range []string{"claude-opus-4-7", "claude-opus-4-8"} {
+		model := LookupModelInfo(modelID)
+		if model == nil || model.Thinking == nil {
+			t.Fatalf("expected %s static model with thinking metadata, got %+v", modelID, model)
+		}
+		if !model.Thinking.ZeroAllowed || !model.Thinking.DynamicAllowed || model.Thinking.Min != 0 || model.Thinking.Max != 0 {
+			t.Fatalf("%s thinking = %+v, want disable-capable adaptive level-only support", modelID, model.Thinking)
+		}
+	}
+
+	for _, modelID := range []string{"claude-fable-5", "claude-mythos-5"} {
+		model := LookupModelInfo(modelID)
+		if model == nil {
+			t.Fatalf("expected %s static model", modelID)
+		}
+		if model.ContextLength != 1000000 || model.MaxCompletionTokens != 128000 {
+			t.Fatalf("%s limits = %+v, want 1M context and 128K output", modelID, model)
+		}
+		if model.Thinking == nil || model.Thinking.ZeroAllowed || !model.Thinking.DynamicAllowed || model.Thinking.Min != 0 || model.Thinking.Max != 0 {
+			t.Fatalf("%s thinking = %+v, want always-on adaptive level-only support", modelID, model.Thinking)
+		}
+	}
+}
+
+func TestClaudeCodeDefaultMaxTokensMatchesNativeCatalog(t *testing.T) {
+	tests := map[string]int{
+		"claude-3-haiku-20240307":      4096,
+		"claude-3-opus-20240229":       4096,
+		"claude-3-5-haiku-20241022":    8192,
+		"claude-3-5-sonnet-20241022":   8192,
+		"claude-3-7-sonnet-20250219":   32000,
+		"claude-haiku-4-5-20251001":    32000,
+		"claude-sonnet-4-5-20250929":   32000,
+		"claude-sonnet-4-6":            32000,
+		"claude-opus-4-5-20251101":     32000,
+		"claude-opus-4-6":              64000,
+		"claude-opus-4-7":              64000,
+		"claude-opus-4-8[1m]":          64000,
+		"claude-sonnet-5":              64000,
+		"us.anthropic.claude-fable-5":  64000,
+		"anthropic.claude-mythos-5-v1": 64000,
+		"fixture-custom-model":         32000,
+		"":                             0,
+	}
+	for model, want := range tests {
+		if got := ClaudeCodeDefaultMaxTokens(model); got != want {
+			t.Errorf("ClaudeCodeDefaultMaxTokens(%q) = %d, want %d", model, got, want)
+		}
+	}
+}

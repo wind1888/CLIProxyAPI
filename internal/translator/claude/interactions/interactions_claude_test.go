@@ -3,10 +3,73 @@ package interactions
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/tidwall/gjson"
 )
+
+func TestConvertInteractionsRequestToClaude_UsesNativeModelDefaultAndPreservesExplicitMax(t *testing.T) {
+	implicit := ConvertInteractionsRequestToClaude("claude-mythos-5", []byte(`{
+		"input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]}]
+	}`), false)
+	if got := gjson.GetBytes(implicit, "max_tokens").Int(); got != 64000 {
+		t.Fatalf("implicit Mythos 5 max_tokens = %d, want Claude Code default 64000: %s", got, implicit)
+	}
+
+	explicit := ConvertInteractionsRequestToClaude("claude-mythos-5", []byte(`{
+		"generation_config":{"max_output_tokens":12345},
+		"input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]}]
+	}`), false)
+	if got := gjson.GetBytes(explicit, "max_tokens").Int(); got != 12345 {
+		t.Fatalf("explicit max_tokens = %d, want 12345: %s", got, explicit)
+	}
+}
+
+func TestConvertInteractionsRequestToClaude_NormalizesToolInputSchema(t *testing.T) {
+	out := ConvertInteractionsRequestToClaude("claude-sonnet-5", []byte(`{
+		"input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]}],
+		"tools":[
+			{"type":"function","name":"empty"},
+			{"type":"function","name":"exact","parameters":{"properties":{"id":{"const":9007199254740993}}}}
+		]
+	}`), false)
+	for index := 0; index < 2; index++ {
+		if got := gjson.GetBytes(out, fmt.Sprintf("tools.%d.input_schema.type", index)).String(); got != "object" {
+			t.Fatalf("tools.%d schema type = %q, want object: %s", index, got, out)
+		}
+	}
+	if got := gjson.GetBytes(out, "tools.1.input_schema.properties.id.const").Raw; got != "9007199254740993" {
+		t.Fatalf("large schema integer = %s, want exact 9007199254740993: %s", got, out)
+	}
+}
+
+func TestConvertInteractionsRequestToClaude_PreservesToolControlSemantics(t *testing.T) {
+	none := ConvertInteractionsRequestToClaude("claude-sonnet-5", []byte(`{
+		"input":"hi",
+		"tools":[{"type":"function","name":"lookup","strict":true}],
+		"tool_choice":"none",
+		"parallel_tool_calls":false
+	}`), false)
+	if !gjson.GetBytes(none, "tools.0.strict").Bool() {
+		t.Fatalf("strict tool flag was lost: %s", none)
+	}
+	if got := gjson.GetBytes(none, "tool_choice.type").String(); got != "none" {
+		t.Fatalf("tool_choice.type = %q, want none: %s", got, none)
+	}
+
+	serial := ConvertInteractionsRequestToClaude("claude-sonnet-5", []byte(`{
+		"input":"hi",
+		"tools":[{"type":"function","name":"lookup"}],
+		"parallelToolCalls":false
+	}`), false)
+	if got := gjson.GetBytes(serial, "tool_choice.type").String(); got != "auto" {
+		t.Fatalf("implicit tool_choice.type = %q, want auto: %s", got, serial)
+	}
+	if !gjson.GetBytes(serial, "tool_choice.disable_parallel_tool_use").Bool() {
+		t.Fatalf("parallelToolCalls=false was lost: %s", serial)
+	}
+}
 
 func TestConvertInteractionsRequestToClaudeWithToolMessagesDirect(t *testing.T) {
 	out := ConvertInteractionsRequestToClaude("claude-test", []byte(`{"model":"claude-test","system_instruction":"be brief","input":[{"type":"user_input","content":[{"type":"text","text":"hi"}]},{"type":"function_call","name":"lookup","call_id":"toolu_1","arguments":{"q":"x"}},{"type":"function_result","name":"lookup","call_id":"toolu_1","result":{"ok":true}}]}`), false)

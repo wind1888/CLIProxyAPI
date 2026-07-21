@@ -10,6 +10,146 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 )
 
+func TestConvertOpenAIResponsesRequestToClaude_UsesNativeModelDefaultAndPreservesExplicitMax(t *testing.T) {
+	implicit := ConvertOpenAIResponsesRequestToClaude("claude-fable-5", []byte(`{
+		"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]
+	}`), false)
+	if got := gjson.GetBytes(implicit, "max_tokens").Int(); got != 64000 {
+		t.Fatalf("implicit Fable 5 max_tokens = %d, want Claude Code default 64000: %s", got, implicit)
+	}
+
+	explicit := ConvertOpenAIResponsesRequestToClaude("claude-fable-5", []byte(`{
+		"max_output_tokens":32000,
+		"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]
+	}`), false)
+	if got := gjson.GetBytes(explicit, "max_tokens").Int(); got != 32000 {
+		t.Fatalf("explicit max_tokens = %d, want 32000: %s", got, explicit)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_MapsInstructionsAndSystemRolesToTopLevelSystem(t *testing.T) {
+	raw := []byte(`{
+		"instructions":"primary instructions",
+		"input":[
+			{"type":"message","role":"developer","content":[{"type":"input_text","text":"developer instructions","cache_control":{"type":"ephemeral"}}]},
+			{"type":"message","role":"system","cache_control":{"type":"ephemeral","ttl":"5m"},"content":[{"type":"input_text","text":"system instructions"}]},
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+		]
+	}`)
+
+	out := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-4-6", raw, false)
+	root := gjson.ParseBytes(out)
+	if got := root.Get("system.#").Int(); got != 3 {
+		t.Fatalf("system block count = %d, want 3: %s", got, out)
+	}
+	for index, want := range []string{"primary instructions", "developer instructions", "system instructions"} {
+		if got := root.Get("system." + string(rune('0'+index)) + ".text").String(); got != want {
+			t.Fatalf("system[%d].text = %q, want %q: %s", index, got, want, out)
+		}
+	}
+	if got := root.Get("system.1.cache_control.type").String(); got != "ephemeral" {
+		t.Fatalf("developer part cache_control.type = %q: %s", got, out)
+	}
+	if got := root.Get("system.2.cache_control.ttl").String(); got != "5m" {
+		t.Fatalf("system message cache_control.ttl = %q: %s", got, out)
+	}
+	if got := root.Get("messages.#").Int(); got != 1 {
+		t.Fatalf("message count = %d, want only user turn: %s", got, out)
+	}
+	if got := root.Get("messages.0.role").String(); got != "user" {
+		t.Fatalf("messages[0].role = %q, want user: %s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_SystemOnlyRequestGetsMinimalUserTurn(t *testing.T) {
+	out := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-4-6", []byte(`{"instructions":"system only"}`), false)
+	if got := gjson.GetBytes(out, "system.0.text").String(); got != "system only" {
+		t.Fatalf("system text = %q: %s", got, out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.role").String(); got != "user" {
+		t.Fatalf("minimal message role = %q, want user: %s", got, out)
+	}
+	if gjson.GetBytes(out, "messages.0.role").String() == "system" {
+		t.Fatalf("Anthropic messages must not contain role=system: %s", out)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.text").String(); got != "\u200b" {
+		t.Fatalf("minimal user text = %q, want non-empty zero-width marker: %s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_MapsStringInputAndHonorsDeclaredAssistantRole(t *testing.T) {
+	stringInput := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-5", []byte(`{"input":"hello"}`), false)
+	if got := gjson.GetBytes(stringInput, "messages.0.content.0.text").String(); got != "hello" {
+		t.Fatalf("string input text = %q, want hello: %s", got, stringInput)
+	}
+
+	assistant := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-5", []byte(`{
+		"input":[{"type":"message","role":"assistant","content":[
+			{"type":"input_text","text":"assistant replay"},
+			{"type":"output_text","text":""}
+		]}]
+	}`), false)
+	if got := gjson.GetBytes(assistant, "messages.0.role").String(); got != "assistant" {
+		t.Fatalf("declared assistant role mapped to %q: %s", got, assistant)
+	}
+	if got := gjson.GetBytes(assistant, "messages.0.content").String(); got != "assistant replay" {
+		t.Fatalf("assistant content = %q, want replay text: %s", got, assistant)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_NormalizesToolInputSchema(t *testing.T) {
+	out := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-5", []byte(`{
+		"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],
+		"tools":[
+			{"type":"function","name":"empty"},
+			{"type":"function","name":"exact","parameters":{"properties":{"id":{"const":9007199254740993}}}}
+		]
+	}`), false)
+	for index := 0; index < 2; index++ {
+		if got := gjson.GetBytes(out, "tools."+string(rune('0'+index))+".input_schema.type").String(); got != "object" {
+			t.Fatalf("tools.%d schema type = %q, want object: %s", index, got, out)
+		}
+	}
+	if got := gjson.GetBytes(out, "tools.1.input_schema.properties.id.const").Raw; got != "9007199254740993" {
+		t.Fatalf("large schema integer = %s, want exact 9007199254740993: %s", got, out)
+	}
+}
+
+func TestConvertOpenAIResponsesRequestToClaude_PreservesToolControlSemantics(t *testing.T) {
+	none := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-5", []byte(`{
+		"input":"hi",
+		"tools":[{"type":"function","name":"lookup","strict":true}],
+		"tool_choice":"none",
+		"parallel_tool_calls":false
+	}`), false)
+	if !gjson.GetBytes(none, "tools.0.strict").Bool() {
+		t.Fatalf("strict tool flag was lost: %s", none)
+	}
+	if got := gjson.GetBytes(none, "tool_choice.type").String(); got != "none" {
+		t.Fatalf("tool_choice.type = %q, want none: %s", got, none)
+	}
+
+	serial := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-5", []byte(`{
+		"input":"hi",
+		"tools":[{"type":"function","name":"lookup"}],
+		"parallel_tool_calls":false
+	}`), false)
+	if got := gjson.GetBytes(serial, "tool_choice.type").String(); got != "auto" {
+		t.Fatalf("implicit tool_choice.type = %q, want auto: %s", got, serial)
+	}
+	if !gjson.GetBytes(serial, "tool_choice.disable_parallel_tool_use").Bool() {
+		t.Fatalf("parallel_tool_calls=false was lost: %s", serial)
+	}
+
+	unknown := ConvertOpenAIResponsesRequestToClaude("claude-sonnet-5", []byte(`{
+		"input":"hi",
+		"tools":[{"type":"custom","name":"shell","format":{"type":"text"}}]
+	}`), false)
+	if gjson.GetBytes(unknown, "tools").Exists() {
+		t.Fatalf("wire-incompatible custom tool leaked into Anthropic tools: %s", unknown)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToClaude_SanitizesToolCallIDsForClaude(t *testing.T) {
 	inputJSON := `{
 		"model": "gpt-4.1",

@@ -1522,6 +1522,27 @@ func TestConvertClaudeRequestToAntigravity_ReorderTextAfterFunctionCall(t *testi
 	}
 }
 
+func TestConvertClaudeRequestToAntigravity_ReorderPreservesLargeToolArgumentInteger(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"claude-sonnet-4-6",
+		"messages":[{
+			"role":"assistant",
+			"content":[
+				{"type":"tool_use","id":"call_large","name":"lookup","input":{"id":9007199254740993}},
+				{"type":"text","text":"Checking."}
+			]
+		}]
+	}`)
+
+	out := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", inputJSON, false)
+	if got := gjson.GetBytes(out, "request.contents.0.parts.0.text").String(); got != "Checking." {
+		t.Fatalf("regular text was not moved before functionCall: %s", out)
+	}
+	if got := gjson.GetBytes(out, "request.contents.0.parts.1.functionCall.args.id").Raw; got != "9007199254740993" {
+		t.Fatalf("large integer changed during parts reorder: got %s, want 9007199254740993; output=%s", got, out)
+	}
+}
+
 func TestConvertClaudeRequestToAntigravity_ReorderParallelFunctionCalls(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "claude-sonnet-4-5",
@@ -2892,5 +2913,29 @@ func TestConvertClaudeRequestToAntigravity_ToolAndThinking_NoExistingSystem(t *t
 	}
 	if !found {
 		t.Errorf("Interleaved thinking hint should be in created systemInstruction, got: %v", sysInstruction.Raw)
+	}
+}
+
+func TestConvertClaudeRequestToAntigravity_MapsStructuredOutputSchemaWithoutPrecisionLoss(t *testing.T) {
+	inputJSON := []byte(`{
+		"model":"claude-sonnet-4-6",
+		"messages":[{"role":"user","content":"Return JSON"}],
+		"output_config":{"format":{"type":"json_schema","schema":{
+			"type":"object",
+			"properties":{"id":{"type":"integer","const":9007199254740993}},
+			"required":["id"]
+		}}}
+	}`)
+
+	output := ConvertClaudeRequestToAntigravity("claude-sonnet-4-6", inputJSON, false)
+	if got := gjson.GetBytes(output, "request.generationConfig.responseMimeType").String(); got != "application/json" {
+		t.Fatalf("responseMimeType = %q, want application/json: %s", got, output)
+	}
+	schema := gjson.GetBytes(output, "request.generationConfig.responseJsonSchema")
+	if !schema.Exists() {
+		t.Fatalf("responseJsonSchema missing: %s", output)
+	}
+	if got := schema.Get("properties.id.const").Raw; got != "9007199254740993" {
+		t.Fatalf("large schema integer = %s, want exact 9007199254740993: %s", got, output)
 	}
 }

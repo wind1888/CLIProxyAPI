@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -322,6 +323,31 @@ func TestFileSynthesizer_Synthesize_SkipsInvalidFiles(t *testing.T) {
 	}
 	if auths[0].Label != "valid@example.com" {
 		t.Errorf("expected label valid@example.com, got %s", auths[0].Label)
+	}
+}
+
+func TestSynthesizeAuthFileAcceptsOfficialClaudeCodeCredentialEnvelope(t *testing.T) {
+	tempDir := t.TempDir()
+	fullPath := filepath.Join(tempDir, ".credentials.json")
+	raw := []byte(`{"installMethod":"native","claudeAiOauth":{"accessToken":"access","refreshToken":"refresh","expiresAt":1784600000000,"scopes":["user:profile","user:inference"],"subscriptionType":"max","rateLimitTier":"tier"}}`)
+	auths := SynthesizeAuthFile(&SynthesisContext{
+		Config:  &config.Config{},
+		AuthDir: tempDir,
+		Now:     time.Now(),
+	}, fullPath, raw)
+	if len(auths) != 1 {
+		t.Fatalf("SynthesizeAuthFile() len = %d, want 1", len(auths))
+	}
+	auth := auths[0]
+	if auth.Provider != "claude" || auth.FileName != ".credentials.json" {
+		t.Fatalf("provider/file = %q/%q", auth.Provider, auth.FileName)
+	}
+	if auth.Metadata["access_token"] != "access" || auth.Metadata["refresh_token"] != "refresh" {
+		t.Fatalf("flattened official metadata = %#v", auth.Metadata)
+	}
+	storage, ok := auth.Storage.(*claudeauth.ClaudeTokenStorage)
+	if !ok || storage.AccessToken != "access" || storage.RefreshToken != "refresh" {
+		t.Fatalf("official token storage = %#v", auth.Storage)
 	}
 }
 

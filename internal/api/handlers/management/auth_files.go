@@ -43,12 +43,12 @@ import (
 var lastRefreshKeys = []string{"last_refresh", "lastRefresh", "last_refreshed_at", "lastRefreshedAt"}
 
 const (
-	anthropicCallbackPort = 54545
-	codexCallbackPort     = 1455
+	codexCallbackPort = 1455
 )
 
 type callbackForwarder struct {
 	provider string
+	port     int
 	server   *http.Server
 	done     chan struct{}
 }
@@ -135,22 +135,30 @@ func isWebUIRequest(c *gin.Context) bool {
 }
 
 func startCallbackForwarder(port int, provider, targetBase string) (*callbackForwarder, error) {
-	callbackForwardersMu.Lock()
-	prev := callbackForwarders[port]
-	if prev != nil {
-		delete(callbackForwarders, port)
-	}
-	callbackForwardersMu.Unlock()
+	if port > 0 {
+		callbackForwardersMu.Lock()
+		prev := callbackForwarders[port]
+		if prev != nil {
+			delete(callbackForwarders, port)
+		}
+		callbackForwardersMu.Unlock()
 
-	if prev != nil {
-		stopForwarderInstance(port, prev)
+		if prev != nil {
+			stopForwarderInstance(port, prev)
+		}
 	}
 
-	addr := fmt.Sprintf("0.0.0.0:%d", port)
-	ln, err := net.Listen("tcp", addr)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	ln, err := net.Listen("tcp4", addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to listen on %s: %w", addr, err)
 	}
+	tcpAddr, okTCP := ln.Addr().(*net.TCPAddr)
+	if !okTCP || tcpAddr.Port <= 0 {
+		_ = ln.Close()
+		return nil, fmt.Errorf("failed to resolve callback forwarder port")
+	}
+	port = tcpAddr.Port
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		target := targetBase
@@ -181,6 +189,7 @@ func startCallbackForwarder(port int, provider, targetBase string) (*callbackFor
 
 	forwarder := &callbackForwarder{
 		provider: provider,
+		port:     port,
 		server:   srv,
 		done:     done,
 	}
@@ -189,7 +198,7 @@ func startCallbackForwarder(port int, provider, targetBase string) (*callbackFor
 	callbackForwarders[port] = forwarder
 	callbackForwardersMu.Unlock()
 
-	log.Infof("callback forwarder for %s listening on %s", provider, addr)
+	log.Infof("callback forwarder for %s listening on 127.0.0.1:%d", provider, port)
 
 	return forwarder, nil
 }
@@ -1924,7 +1933,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	}
 
 	// Generate random state parameter
-	state, err := misc.GenerateRandomState()
+	state, err := claude.GenerateOAuthState()
 	if err != nil {
 		log.Errorf("Failed to generate state parameter: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate state parameter"})
@@ -1934,43 +1943,29 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 	// Initialize Claude auth service
 	anthropicAuth := claude.NewClaudeAuth(h.cfg)
 
-	// Generate authorization URL (then override redirect_uri to reuse server port)
-	authURL, state, err := anthropicAuth.GenerateAuthURL(state, pkceCodes)
+	// Management clients may be running on a different machine from CPA. Always
+	// use Anthropic's hosted copy/paste callback here: a localhost redirect would
+	// point at the browser's machine and would not match a later manual exchange.
+	manualAuthURL, state, err := anthropicAuth.GenerateAuthURLWithRedirectURI(state, pkceCodes, claude.RedirectURI)
 	if err != nil {
-		log.Errorf("Failed to generate authorization URL: %v", err)
+		log.Errorf("Failed to generate manual authorization URL: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
 		return
 	}
 
 	RegisterOAuthSession(state, "anthropic")
 
-	isWebUI := isWebUIRequest(c)
-	var forwarder *callbackForwarder
-	if isWebUI {
-		targetURL, errTarget := h.managementCallbackURL("/anthropic/callback")
-		if errTarget != nil {
-			log.WithError(errTarget).Error("failed to compute anthropic callback target")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
-			return
-		}
-		var errStart error
-		if forwarder, errStart = startCallbackForwarder(anthropicCallbackPort, "anthropic", targetURL); errStart != nil {
-			log.WithError(errStart).Error("failed to start anthropic callback forwarder")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
-			return
-		}
-	}
-
 	go func() {
-		if isWebUI {
-			defer stopCallbackForwarderInstance(anthropicCallbackPort, forwarder)
-		}
-
 		// Helper: wait for callback file
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-anthropic-%s.oauth", state))
 		waitForFile := func(path string, timeout time.Duration) (map[string]string, error) {
 			deadline := time.Now().Add(timeout)
 			for {
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				default:
+				}
 				if !IsOAuthSessionPending(state, "anthropic") {
 					return nil, errOAuthSessionNotPending
 				}
@@ -1985,29 +1980,42 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 					_ = os.Remove(path)
 					return m, nil
 				}
-				time.Sleep(500 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(500 * time.Millisecond):
+				}
 			}
 		}
 
 		fmt.Println("Waiting for authentication callback...")
-		// Wait up to 5 minutes
 		resultMap, errWait := waitForFile(waitFile, 5*time.Minute)
 		if errWait != nil {
 			if errors.Is(errWait, errOAuthSessionNotPending) {
 				return
 			}
-			authErr := claude.NewAuthenticationError(claude.ErrCallbackTimeout, errWait)
+			errorCode := claude.ErrServerStartFailed
+			errorStatus := "OAuth callback failed"
+			if strings.Contains(strings.ToLower(errWait.Error()), "timeout") {
+				errorCode = claude.ErrCallbackTimeout
+				errorStatus = "Timeout waiting for OAuth callback"
+			} else if strings.Contains(strings.ToLower(errWait.Error()), "state") {
+				errorCode = claude.ErrInvalidState
+				errorStatus = "State code error"
+			}
+			authErr := claude.NewAuthenticationError(errorCode, errWait)
 			log.Error(claude.GetUserFriendlyMessage(authErr))
+			SetOAuthSessionError(state, errorStatus)
 			return
 		}
-		if errStr := resultMap["error"]; errStr != "" {
+		if errStr := resultMap["error"]; errStr != "" && strings.TrimSpace(resultMap["code"]) == "" {
 			oauthErr := claude.NewOAuthError(errStr, "", http.StatusBadRequest)
 			log.Error(claude.GetUserFriendlyMessage(oauthErr))
 			SetOAuthSessionError(state, "Bad request")
 			return
 		}
 		if resultMap["state"] != state {
-			authErr := claude.NewAuthenticationError(claude.ErrInvalidState, fmt.Errorf("expected %s, got %s", state, resultMap["state"]))
+			authErr := claude.NewAuthenticationError(claude.ErrInvalidState, fmt.Errorf("state mismatch"))
 			log.Error(claude.GetUserFriendlyMessage(authErr))
 			SetOAuthSessionError(state, "State code error")
 			return
@@ -2017,8 +2025,8 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		rawCode := resultMap["code"]
 		code := strings.Split(rawCode, "#")[0]
 
-		// Exchange code for tokens using internal auth service
-		bundle, errExchange := anthropicAuth.ExchangeCodeForTokens(ctx, code, state, pkceCodes)
+		// This redirect URI is the same value embedded in manualAuthURL above.
+		bundle, errExchange := anthropicAuth.ExchangeCodeForTokensWithRedirectURI(ctx, code, state, pkceCodes, claude.RedirectURI)
 		if errExchange != nil {
 			authErr := claude.NewAuthenticationError(claude.ErrCodeExchangeFailed, errExchange)
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
@@ -2040,10 +2048,20 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 			FileName: fileName,
 			Storage:  tokenStorage,
 			Metadata: map[string]any{
-				"email":             tokenStorage.Email,
-				"account_uuid":      tokenStorage.AccountUUID,
-				"organization_uuid": tokenStorage.OrganizationUUID,
-				"auth_kind":         "oauth",
+				"access_token":             tokenStorage.AccessToken,
+				"refresh_token":            tokenStorage.RefreshToken,
+				"last_refresh":             tokenStorage.LastRefresh,
+				"expired":                  tokenStorage.Expire,
+				"email":                    tokenStorage.Email,
+				"account_uuid":             tokenStorage.AccountUUID,
+				"organization_uuid":        tokenStorage.OrganizationUUID,
+				"scopes":                   append([]string(nil), tokenStorage.Scopes...),
+				"refresh_token_expires_at": tokenStorage.RefreshTokenExpiresAt,
+				"subscription_type":        tokenStorage.SubscriptionType,
+				"rate_limit_tier":          tokenStorage.RateLimitTier,
+				"client_id":                tokenStorage.ClientID,
+				"type":                     "claude",
+				"auth_kind":                "oauth",
 			},
 			Attributes: map[string]string{"auth_kind": "oauth"},
 		}
@@ -2065,7 +2083,7 @@ func (h *Handler) RequestAnthropicToken(c *gin.Context) {
 		CompleteOAuthSession(state)
 	}()
 
-	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+	c.JSON(200, gin.H{"status": "ok", "url": manualAuthURL, "manual_url": manualAuthURL, "state": state})
 }
 
 func (h *Handler) RequestCodexToken(c *gin.Context) {

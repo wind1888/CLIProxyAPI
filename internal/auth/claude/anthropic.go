@@ -21,6 +21,17 @@ type ClaudeTokenData struct {
 	AccountUUID string `json:"account_uuid"`
 	// OrganizationUUID identifies the Anthropic organization returned by OAuth.
 	OrganizationUUID string `json:"organization_uuid"`
+	// Scope is the space-delimited OAuth scope set returned by Anthropic.
+	Scope string `json:"scope,omitempty"`
+	// RefreshTokenExpiresAt is the rotating refresh-token expiry in Unix
+	// milliseconds, matching Claude Code's credential representation.
+	RefreshTokenExpiresAt int64 `json:"refresh_token_expires_at,omitempty"`
+	// SubscriptionType and RateLimitTier are derived from the OAuth profile.
+	SubscriptionType string `json:"subscription_type,omitempty"`
+	RateLimitTier    string `json:"rate_limit_tier,omitempty"`
+	// ClientID is only populated for a non-default OAuth client. An empty value
+	// means Anthropic's first-party Claude Code client ID.
+	ClientID string `json:"client_id,omitempty"`
 	// Expire is the timestamp of the token expire
 	Expire string `json:"expired"`
 }

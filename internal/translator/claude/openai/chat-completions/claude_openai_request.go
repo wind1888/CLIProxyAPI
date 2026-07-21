@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
@@ -23,10 +24,23 @@ import (
 )
 
 var (
-	user    = ""
-	account = ""
-	session = ""
+	claudeChatIdentityOnce sync.Once
+	claudeChatUser         string
+	claudeChatAccount      string
+	claudeChatSession      string
 )
+
+func claudeChatSyntheticUserID() string {
+	claudeChatIdentityOnce.Do(func() {
+		accountID, _ := uuid.NewRandom()
+		sessionID, _ := uuid.NewRandom()
+		claudeChatAccount = accountID.String()
+		claudeChatSession = sessionID.String()
+		sum := sha256.Sum256([]byte(claudeChatAccount + claudeChatSession))
+		claudeChatUser = hex.EncodeToString(sum[:])
+	})
+	return fmt.Sprintf("user_%s_account_%s_session_%s", claudeChatUser, claudeChatAccount, claudeChatSession)
+}
 
 // ConvertOpenAIRequestToClaude parses and transforms an OpenAI Chat Completions API request into Claude Code API format.
 // It extracts the model name, system instruction, message contents, and tool declarations
@@ -48,22 +62,11 @@ var (
 func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream bool) []byte {
 	rawJSON := inputRawJSON
 
-	if account == "" {
-		u, _ := uuid.NewRandom()
-		account = u.String()
-	}
-	if session == "" {
-		u, _ := uuid.NewRandom()
-		session = u.String()
-	}
-	if user == "" {
-		sum := sha256.Sum256([]byte(account + session))
-		user = hex.EncodeToString(sum[:])
-	}
-	userID := fmt.Sprintf("user_%s_account_%s_session_%s", user, account, session)
+	userID := claudeChatSyntheticUserID()
 
-	// Base Claude Code API template with default max_tokens value
-	out := []byte(fmt.Sprintf(`{"model":"","max_tokens":32000,"messages":[],"metadata":{"user_id":"%s"}}`, userID))
+	// Base Claude Code API template with the current model-specific default.
+	defaultMaxTokens := registry.ClaudeCodeDefaultMaxTokens(modelName)
+	out := []byte(fmt.Sprintf(`{"model":"","max_tokens":%d,"messages":[],"metadata":{"user_id":"%s"}}`, defaultMaxTokens, userID))
 
 	root := gjson.ParseBytes(rawJSON)
 
@@ -133,7 +136,11 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 	out, _ = sjson.SetBytes(out, "model", modelName)
 
 	// Max tokens configuration with fallback to default value
-	if maxTokens := root.Get("max_tokens"); maxTokens.Exists() {
+	maxTokens := root.Get("max_tokens")
+	if !maxTokens.Exists() {
+		maxTokens = root.Get("max_completion_tokens")
+	}
+	if maxTokens.Exists() {
 		out, _ = sjson.SetBytes(out, "max_tokens", maxTokens.Int())
 	}
 
@@ -164,41 +171,70 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 	// Process messages and transform them to Claude Code format
 	if messages := root.Get("messages"); messages.Exists() && messages.IsArray() {
 		messageIndex := 0
-		messages.ForEach(func(_, message gjson.Result) bool {
-			role := message.Get("role").String()
+		previousConversationRole := ""
+		messageItems := messages.Array()
+		nextConversationRole := func(index int) string {
+			for i := index + 1; i < len(messageItems); i++ {
+				role := strings.ToLower(strings.TrimSpace(messageItems[i].Get("role").String()))
+				switch role {
+				case "system", "developer":
+					continue
+				case "assistant":
+					return "assistant"
+				case "user", "tool":
+					return "user"
+				}
+			}
+			return ""
+		}
+		messages.ForEach(func(indexResult, message gjson.Result) bool {
+			role := strings.ToLower(strings.TrimSpace(message.Get("role").String()))
 			contentResult := message.Get("content")
 
 			switch role {
-			case "system":
-				systemStart := len(gjson.GetBytes(out, "system").Array())
+			case "system", "developer":
+				blocks := []byte(`[]`)
 				if contentResult.Exists() && contentResult.Type == gjson.String && contentResult.String() != "" {
 					textPart := []byte(`{"type":"text","text":""}`)
 					textPart, _ = sjson.SetBytes(textPart, "text", contentResult.String())
 					textPart = common.AttachCacheControl(textPart, message)
-					out, _ = sjson.SetRawBytes(out, "system.-1", textPart)
+					blocks, _ = sjson.SetRawBytes(blocks, "-1", textPart)
 				} else if contentResult.Exists() && contentResult.IsArray() {
 					contentResult.ForEach(func(_, part gjson.Result) bool {
-						if part.Get("type").String() == "text" {
+						if part.Get("type").String() == "text" && part.Get("text").String() != "" {
 							textPart := []byte(`{"type":"text","text":""}`)
 							textPart, _ = sjson.SetBytes(textPart, "text", part.Get("text").String())
 							textPart = common.AttachCacheControl(textPart, part)
-							out, _ = sjson.SetRawBytes(out, "system.-1", textPart)
+							blocks, _ = sjson.SetRawBytes(blocks, "-1", textPart)
 						}
 						return true
 					})
-					// Message-level cache_control applies to the last system block from this message.
-					if message.Get("cache_control").Exists() {
-						systemArr := gjson.GetBytes(out, "system").Array()
-						if len(systemArr) > systemStart {
-							lastIdx := len(systemArr) - 1
-							if !systemArr[lastIdx].Get("cache_control").Exists() {
-								path := fmt.Sprintf("system.%d", lastIdx)
-								block := []byte(systemArr[lastIdx].Raw)
-								block = common.AttachCacheControl(block, message)
-								out, _ = sjson.SetRawBytes(out, path, block)
-							}
-						}
+				}
+				blockItems := gjson.ParseBytes(blocks).Array()
+				if len(blockItems) == 0 {
+					return true
+				}
+				if message.Get("cache_control").Exists() {
+					lastIdx := len(blockItems) - 1
+					if !blockItems[lastIdx].Get("cache_control").Exists() {
+						block := common.AttachCacheControl([]byte(blockItems[lastIdx].Raw), message)
+						blocks, _ = sjson.SetRawBytes(blocks, fmt.Sprintf("%d", lastIdx), block)
 					}
+				}
+
+				nextRole := nextConversationRole(int(indexResult.Int()))
+				useMidConversation := common.ClaudeSupportsMidConversationSystem(modelName) &&
+					previousConversationRole == "user" && (nextRole == "" || nextRole == "assistant")
+				if useMidConversation {
+					mid := []byte(`{"role":"system","content":[]}`)
+					mid, _ = sjson.SetRawBytes(mid, "content", blocks)
+					out, _ = sjson.SetRawBytes(out, "messages.-1", mid)
+					messageIndex++
+				} else {
+					gjson.ParseBytes(blocks).ForEach(func(_, block gjson.Result) bool {
+						out, _ = sjson.SetRawBytes(out, "system.-1", []byte(block.Raw))
+						return true
+					})
 				}
 			case "user", "assistant":
 				msg := []byte(`{"role":"","content":[]}`)
@@ -257,9 +293,12 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 					})
 				}
 
-				msg = common.AttachMessageCacheControl(msg, message)
-				out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
-				messageIndex++
+				if len(gjson.GetBytes(msg, "content").Array()) > 0 {
+					msg = common.AttachMessageCacheControl(msg, message)
+					out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
+					messageIndex++
+					previousConversationRole = role
+				}
 
 			case "tool":
 				// Handle tool result messages conversion
@@ -278,6 +317,7 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 				msg = common.AttachMessageCacheControl(msg, message)
 				out, _ = sjson.SetRawBytes(out, "messages.-1", msg)
 				messageIndex++
+				previousConversationRole = "user"
 			}
 			return true
 		})
@@ -287,7 +327,7 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		if messageIndex == 0 {
 			system := gjson.GetBytes(out, "system")
 			if system.Exists() && system.IsArray() && len(system.Array()) > 0 {
-				fallbackMsg := []byte(`{"role":"user","content":[{"type":"text","text":""}]}`)
+				fallbackMsg := []byte(`{"role":"user","content":[{"type":"text","text":"\u200b"}]}`)
 				out, _ = sjson.SetRawBytes(out, "messages.-1", fallbackMsg)
 			}
 		}
@@ -299,16 +339,21 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		tools.ForEach(func(_, tool gjson.Result) bool {
 			if tool.Get("type").String() == "function" {
 				function := tool.Get("function")
-				anthropicTool := []byte(`{"name":"","description":""}`)
+				anthropicTool := []byte(`{"name":"","description":"","input_schema":{"type":"object","properties":{}}}`)
 				anthropicTool, _ = sjson.SetBytes(anthropicTool, "name", function.Get("name").String())
 				anthropicTool, _ = sjson.SetBytes(anthropicTool, "description", function.Get("description").String())
+				if strict := function.Get("strict"); strict.Type == gjson.True || strict.Type == gjson.False {
+					anthropicTool, _ = sjson.SetBytes(anthropicTool, "strict", strict.Bool())
+				} else if strict := tool.Get("strict"); strict.Type == gjson.True || strict.Type == gjson.False {
+					anthropicTool, _ = sjson.SetBytes(anthropicTool, "strict", strict.Bool())
+				}
 
 				// Convert parameters schema for the tool
-				if parameters := function.Get("parameters"); parameters.Exists() {
-					anthropicTool, _ = sjson.SetRawBytes(anthropicTool, "input_schema", []byte(parameters.Raw))
-				} else if parameters := function.Get("parametersJsonSchema"); parameters.Exists() {
-					anthropicTool, _ = sjson.SetRawBytes(anthropicTool, "input_schema", []byte(parameters.Raw))
+				parameters := function.Get("parameters")
+				if !parameters.Exists() {
+					parameters = function.Get("parametersJsonSchema")
 				}
+				anthropicTool, _ = sjson.SetRawBytes(anthropicTool, "input_schema", common.NormalizeClaudeToolInputSchema(parameters))
 				anthropicTool = common.AttachCacheControl(anthropicTool, tool)
 				if !gjson.GetBytes(anthropicTool, "cache_control").Exists() {
 					anthropicTool = common.AttachCacheControl(anthropicTool, function)
@@ -332,7 +377,7 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 			choice := toolChoice.String()
 			switch choice {
 			case "none":
-				// Don't set tool_choice, Claude Code will not use tools
+				out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"none"}`))
 			case "auto":
 				out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"auto"}`))
 			case "required":
@@ -349,6 +394,16 @@ func ConvertOpenAIRequestToClaude(modelName string, inputRawJSON []byte, stream 
 		default:
 		}
 	}
+	if parallel := root.Get("parallel_tool_calls"); parallel.Type == gjson.False && len(gjson.GetBytes(out, "tools").Array()) > 0 {
+		choiceType := gjson.GetBytes(out, "tool_choice.type").String()
+		if choiceType == "" {
+			out, _ = sjson.SetRawBytes(out, "tool_choice", []byte(`{"type":"auto"}`))
+			choiceType = "auto"
+		}
+		if choiceType != "none" {
+			out, _ = sjson.SetBytes(out, "tool_choice.disable_parallel_tool_use", true)
+		}
+	}
 
 	return out
 }
@@ -357,6 +412,9 @@ func convertOpenAIContentPartToClaudePart(part gjson.Result) string {
 	var claudePart []byte
 	switch part.Get("type").String() {
 	case "text":
+		if part.Get("text").String() == "" {
+			return ""
+		}
 		textPart := []byte(`{"type":"text","text":""}`)
 		textPart, _ = sjson.SetBytes(textPart, "text", part.Get("text").String())
 		claudePart = textPart

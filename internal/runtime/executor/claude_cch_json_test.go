@@ -8,170 +8,169 @@ import (
 	"testing"
 
 	xxHash64 "github.com/pierrec/xxHash/xxHash64"
-	"github.com/tidwall/gjson"
 )
 
-const testClaudeCCHBillingHeader = "x-anthropic-billing-header: cc_version=2.1.215.abc; cc_entrypoint=sdk-cli; cch=fffff;"
-
 func TestBuildClaudeCCHMaterialMatchesOfficialGolden(t *testing.T) {
-	body, err := os.ReadFile("testdata/cch-cc2.1.177.json")
+	signed, err := os.ReadFile("testdata/cch-cc2.1.215.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	billingHeader := gjson.GetBytes(body, "system.0.text").String()
-	material, err := buildClaudeCCHMaterial(body, billingHeader)
+	signed = bytes.TrimSuffix(signed, []byte("\n"))
+	body := bytes.Replace(signed, []byte("cch=c4060;"), []byte("cch=00000;"), 1)
+	material, err := buildClaudeCCHMaterial(body)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := fmt.Sprintf("%05x", xxHash64.Checksum(material, claudeCCHSeed)&0xfffff)
-	if got != "a82da" {
-		t.Fatalf("cch = %q, want official golden %q", got, "a82da")
+	if got != "c4060" {
+		t.Fatalf("cch = %q, want official golden %q", got, "c4060")
 	}
 }
 
-func TestBuildClaudeCCHMaterialMatchesECMAScriptProjection(t *testing.T) {
-	body := []byte(` {
-  "\u006dodel": "ignored",
-  "messages": [{"role":"user","content":"\u4e2d\u003c\/"}],
-  "system": [{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.215.abc; cc_entrypoint=sdk-cli; cch=fffff;"}],
-  "max_\u0074okens": 1.0,
-  "temperature": 1e+02,
-  "metadata": {"z":0,"10":"ten","2":"two","a":1},
-  "negzero": -0,
-  "big": 9007199254740993
-} `)
+func TestBuildClaudeCCHMaterialUsesRawByteProjection(t *testing.T) {
+	body := []byte(" {\n" +
+		`"model":"primary",` + "\n" +
+		`"fallbacks":["one",{"quoted":"[not]","nested":[1]}],` + "\n" +
+		`"messages":[{"role":"user","content":"\u0041"}],` + "\n" +
+		`"fallback_credit_token":"route",` + "\n" +
+		`"max_tokens":0032000,` + "\n" +
+		`"system":[{"text":"x-anthropic-billing-header: cch=00000;"}],` + "\n" +
+		`"nested":{"model":"secondary"},"temperature":1e+00` + "\n}")
 
-	got, err := buildClaudeCCHMaterial(body, testClaudeCCHBillingHeader)
+	got, err := buildClaudeCCHMaterial(body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []byte(`{"model":"","messages":[{"role":"user","content":"中</"}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.215.abc; cc_entrypoint=sdk-cli; cch=00000;"}],"temperature":100,"metadata":{"2":"two","10":"ten","z":0,"a":1},"negzero":0,"big":9007199254740992}`)
+	want := []byte(" {\n" +
+		`"model":"",` + "\n" +
+		"\n" +
+		`"messages":[{"role":"user","content":"\u0041"}],` + "\n" +
+		"\n" +
+		"\n" +
+		`"system":[{"text":"x-anthropic-billing-header: cch=00000;"}],` + "\n" +
+		`"nested":{"model":""},"temperature":1e+00` + "\n}")
 	if !bytes.Equal(got, want) {
 		t.Fatalf("material mismatch\nwant: %s\n got: %s", want, got)
 	}
 }
 
-func TestBuildClaudeCCHMaterialDuplicateProperties(t *testing.T) {
-	body := []byte(`{
-  "model":"first",
-  "model":"second",
-  "fallbacks":[1],
-  "x":1,
-  "fallbacks":[2],
-  "fallback_credit_token":"routing",
-  "max_tokens":1,
-  "system":[{"text":"x-anthropic-billing-header: cc_version=2.1.215.abc; cc_entrypoint=sdk-cli; cch=fffff;"}],
-  "messages":[],
-  "nested":{"a":1,"\u0061":2}
-}`)
-
-	got, err := buildClaudeCCHMaterial(body, testClaudeCCHBillingHeader)
+func TestBuildClaudeCCHMaterialPreservesEquivalentJSONSpelling(t *testing.T) {
+	base := []byte(`{"model":"x","messages":[{"content":"A"}],"system":[{"text":"cch=00000"}],"stream":true}`)
+	variants := [][]byte{
+		[]byte(`{"model":"x", "messages":[{"content":"A"}],"system":[{"text":"cch=00000"}],"stream":true}`),
+		[]byte(`{"model":"x","messages":[{"content":"\u0041"}],"system":[{"text":"cch=00000"}],"stream":true}`),
+		[]byte(`{"messages":[{"content":"A"}],"model":"x","system":[{"text":"cch=00000"}],"stream":true}`),
+		[]byte(`{"model":"x","messages":[{"content":"A"}],"system":[{"text":"cch=00000"}],"stream":true,"stream":true}`),
+	}
+	baseMaterial, err := buildClaudeCCHMaterial(base)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []byte(`{"model":"","x":1,"system":[{"text":"x-anthropic-billing-header: cc_version=2.1.215.abc; cc_entrypoint=sdk-cli; cch=00000;"}],"messages":[],"nested":{"a":2}}`)
-	if !bytes.Equal(got, want) {
-		t.Fatalf("material mismatch\nwant: %s\n got: %s", want, got)
-	}
-}
-
-func TestBuildClaudeCCHMaterialECMAScriptPropertyOrder(t *testing.T) {
-	body := []byte(`{
-  "messages":[],
-  "system":[{"text":"x-anthropic-billing-header: cc_version=2.1.215.abc; cc_entrypoint=sdk-cli; cch=fffff;"}],
-  "object":{"4294967295":"not-index","01":"leading","10":"ten","2":"two","0":"zero","4294967294":"last-index","-0":"minus"}
-}`)
-
-	got, err := buildClaudeCCHMaterial(body, testClaudeCCHBillingHeader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []byte(`{"messages":[],"system":[{"text":"x-anthropic-billing-header: cc_version=2.1.215.abc; cc_entrypoint=sdk-cli; cch=00000;"}],"object":{"0":"zero","2":"two","10":"ten","4294967294":"last-index","4294967295":"not-index","01":"leading","-0":"minus"},"model":""}`)
-	if !bytes.Equal(got, want) {
-		t.Fatalf("material mismatch\nwant: %s\n got: %s", want, got)
-	}
-}
-
-func TestBuildClaudeCCHMaterialECMAScriptStrings(t *testing.T) {
-	body := []byte(`{"model":"x","system":[{"text":"x-anthropic-billing-header: cc_version=2.1.215.abc; cc_entrypoint=sdk-cli; cch=fffff;"}],"s":"\u2028\u2029\ud83d\ude00\ud800x\udc00","html":"\u003c\u003e\u0026","slash":"\/"}`)
-
-	got, err := buildClaudeCCHMaterial(body, testClaudeCCHBillingHeader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantString := "\u2028\u2029😀" + `\ud800x\udc00`
-	for _, fragment := range []string{
-		`"s":"` + wantString + `"`,
-		`"html":"<>&"`,
-		`"slash":"/"`,
-	} {
-		if !bytes.Contains(got, []byte(fragment)) {
-			t.Fatalf("material %s does not contain %q", got, fragment)
+	baseHash := xxHash64.Checksum(baseMaterial, claudeCCHSeed) & 0xfffff
+	for index, variant := range variants {
+		material, errVariant := buildClaudeCCHMaterial(variant)
+		if errVariant != nil {
+			t.Fatalf("variant %d: %v", index, errVariant)
+		}
+		if bytes.Equal(material, baseMaterial) {
+			t.Fatalf("variant %d was normalized instead of preserving raw bytes", index)
+		}
+		if gotHash := xxHash64.Checksum(material, claudeCCHSeed) & 0xfffff; gotHash == baseHash {
+			t.Fatalf("variant %d unexpectedly retained hash %05x", index, gotHash)
 		}
 	}
 }
 
-func TestBuildClaudeCCHMaterialECMAScriptNumbers(t *testing.T) {
-	body := []byte(`{
-  "model":"x",
-  "system":[{"text":"x-anthropic-billing-header: cc_version=2.1.215.abc; cc_entrypoint=sdk-cli; cch=fffff;"}],
-  "a":1e20,"b":1e21,"c":1e-7,"d":1e-6,"e":-1e400,"f":1e400,"g":-1e-4000
-}`)
-
-	got, err := buildClaudeCCHMaterial(body, testClaudeCCHBillingHeader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, fragment := range []string{
-		`"a":100000000000000000000`,
-		`"b":1e+21`,
-		`"c":1e-7`,
-		`"d":0.000001`,
-		`"e":null`,
-		`"f":null`,
-		`"g":0`,
-	} {
-		if !bytes.Contains(got, []byte(fragment)) {
-			t.Fatalf("material %s does not contain %q", got, fragment)
-		}
-	}
-}
-
-func TestBuildClaudeCCHMaterialRejectsWrongTarget(t *testing.T) {
-	validBody := []byte(`{"model":"x","system":[{"text":"x-anthropic-billing-header: cc_version=2.1.215.abc; cc_entrypoint=sdk-cli; cch=fffff;"}]}`)
+func TestProjectClaudeCCHBodyCommaRules(t *testing.T) {
 	tests := map[string]struct {
-		body    []byte
-		header  string
-		wantErr string
+		body string
+		want string
 	}{
-		"malformed JSON": {
-			body:    append(bytes.Clone(validBody), '{'),
-			header:  testClaudeCCHBillingHeader,
-			wantErr: "trailing data",
+		"prefer trailing comma": {
+			body: `{"fallbacks":[],"x":1}`,
+			want: `{"x":1}`,
 		},
-		"mismatched header": {
-			body:    validBody,
-			header:  strings.Replace(testClaudeCCHBillingHeader, "fffff", "00000", 1),
-			wantErr: "does not match",
+		"otherwise preceding comma": {
+			body: `{"x":1,"fallback_credit_token":"route"}`,
+			want: `{"x":1}`,
 		},
-		"missing system": {
-			body:    []byte(`{"model":"x"}`),
-			header:  testClaudeCCHBillingHeader,
-			wantErr: "system[0]",
+		"whitespace blocks adjacent comma": {
+			body: `{"max_tokens":12 ,"x":1}`,
+			want: `{ ,"x":1}`,
 		},
-		"content-only cch": {
-			body:    []byte(`{"model":"x","messages":[{"content":"cc_entrypoint=sdk-cli; cch=dead1;"}],"system":[{"text":"ordinary text"}]}`),
-			header:  "ordinary text",
-			wantErr: "0 signing placeholders",
+		"zero digits leaves match untouched": {
+			body: `{"max_tokens":-1,"x":1}`,
+			want: `{"max_tokens":-1,"x":1}`,
+		},
+		"search boundary keeps prior comma": {
+			body: `{"x":1,"max_tokens":1,"fallbacks":[]}`,
+			want: `{"x":1,}`,
+		},
+		"unclosed first fallbacks blocks later match": {
+			body: `{"fallbacks":[0,"fallbacks":[]}`,
+			want: `{"fallbacks":[0,"fallbacks":[]}`,
 		},
 	}
-
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			_, err := buildClaudeCCHMaterial(test.body, test.header)
-			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
-				t.Fatalf("error = %v, want containing %q", err, test.wantErr)
+			if got := string(projectClaudeCCHBody([]byte(test.body))); got != test.want {
+				t.Fatalf("projection = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestProjectClaudeCCHBodyNativeStringBoundaries(t *testing.T) {
+	// model and fallback_credit_token stop at the next raw quote, even an
+	// escaped one; fallbacks instead understands strings and escaped quotes.
+	body := []byte(`{"model":"a\"b","fallback_credit_token":"a\"b","fallbacks":["]","\\\"["],"x":1}`)
+	want := []byte(`{"model":""b"b","x":1}`)
+	if got := projectClaudeCCHBody(body); !bytes.Equal(got, want) {
+		t.Fatalf("projection mismatch\nwant: %s\n got: %s", want, got)
+	}
+}
+
+func TestProjectClaudeCCHBodyClosingModelQuoteCanStartField(t *testing.T) {
+	body := []byte(`AA"model":"unterminated"max_tokens":12`)
+	want := []byte(`AA"model":"`)
+	if got := projectClaudeCCHBody(body); !bytes.Equal(got, want) {
+		t.Fatalf("projection mismatch\nwant: %s\n got: %s", want, got)
+	}
+}
+
+func TestFindClaudeCCHPlaceholderExactWindow(t *testing.T) {
+	prefix := []byte(`{"message":"cch=00000","system":[`)
+	body := append(bytes.Clone(prefix), []byte(`{"text":"cch=00000"}]}`)...)
+	offset, ok := findClaudeCCHPlaceholder(body)
+	if !ok || string(body[offset:offset+5]) != "00000" {
+		t.Fatalf("placeholder = (%d, %v)", offset, ok)
+	}
+	if offset <= bytes.Index(body, []byte(`"system":[`)) {
+		t.Fatalf("selected placeholder before system anchor: %d", offset)
+	}
+
+	for name, invalid := range map[string][]byte{
+		"system spelling":     []byte(`{"system" :[{"text":"cch=00000"}]}`),
+		"already signed":      []byte(`{"system":[{"text":"cch=abcde"}]}`),
+		"outside 300 bytes":   []byte(`{"system":[` + strings.Repeat("x", 291) + `cch=00000`),
+		"placeholder missing": []byte(`{"system":[{}]}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, found := findClaudeCCHPlaceholder(invalid); found {
+				t.Fatal("unexpected placeholder match")
+			}
+		})
+	}
+}
+
+func TestBuildClaudeCCHMaterialDoesNotRequireValidJSON(t *testing.T) {
+	body := []byte(`not-json "model":"value" "system":[ cch=00000 "max_tokens":12, tail`)
+	got, err := buildClaudeCCHMaterial(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte(`not-json "model":"" "system":[ cch=00000  tail`)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("material mismatch\nwant: %s\n got: %s", want, got)
 	}
 }

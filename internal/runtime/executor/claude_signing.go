@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -10,79 +11,99 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 // claudeCCHSeed is the seed used by Claude Code's native request-body signer.
-// It is verified against official 2.1.177, 2.1.207, 2.1.210, 2.1.211,
-// 2.1.212, and 2.1.215 requests and the 2.1.215 darwin-arm64 binary.
+// It is verified against official 2.1.215 and 2.1.216 requests and binaries.
 const claudeCCHSeed uint64 = 0x4D659218E32A3268
 
 var claudeCCHSeedsByVersion = map[string]uint64{
-	"2.1.177": claudeCCHSeed,
-	"2.1.207": claudeCCHSeed,
-	"2.1.210": claudeCCHSeed,
-	"2.1.211": claudeCCHSeed,
-	"2.1.212": claudeCCHSeed,
 	"2.1.215": claudeCCHSeed,
+	"2.1.216": claudeCCHSeed,
 }
 
 // Anchor cch to the generated billing header so a user message that quotes a
 // cch token is never used as the placeholder or rewritten.
 var claudeBillingHeaderCCHPattern = regexp.MustCompile(`(cc_entrypoint=[a-z0-9-]{1,32}; cch=)[0-9a-fA-F]{5}(;)`)
-var claudeBillingHeaderVersionPattern = regexp.MustCompile(`\bcc_version=([0-9]+\.[0-9]+\.[0-9]+)\.[0-9a-fA-F]{3};`)
+var claudeBillingHeaderVersionedCCHPattern = regexp.MustCompile(`x-anthropic-billing-header: cc_version=([0-9]+\.[0-9]+\.[0-9]+)\.[0-9a-fA-F]{3}; cc_entrypoint=[a-z0-9-]{1,32}; cch=([0-9a-fA-F]{5});`)
 
 func claudeCCHSeedForVersion(version string) (uint64, bool) {
 	seed, ok := claudeCCHSeedsByVersion[strings.TrimSpace(version)]
 	return seed, ok
 }
 
-func claudeCCHSigningEnabled(cfg *config.Config, firstPartyOAuth bool, baseURL string) bool {
-	if !isClaudeFirstPartyBaseURL(baseURL) {
+func claudeCCHSigningEnabled(_ *config.Config, firstPartyOAuth bool, baseURL string) bool {
+	if !firstPartyOAuth || !isClaudeFirstPartyBaseURL(baseURL) {
 		return false
 	}
-	version := helps.DefaultClaudeVersion(cfg)
-	if firstPartyOAuth {
-		version = helps.OfficialClaudeCodeOAuthProfile().Version
-	}
+	version := helps.OfficialClaudeCodeOAuthProfile().Version
 	_, supported := claudeCCHSeedForVersion(version)
 	return supported
 }
 
 func signAnthropicMessagesBody(body []byte) ([]byte, error) {
-	billingBlock := gjson.GetBytes(body, "system.0.text")
-	if billingBlock.Type != gjson.String {
-		return body, fmt.Errorf("Claude cch billing block is missing or not text")
+	placeholderOffset, ok := findClaudeCCHPlaceholder(body)
+	if !ok {
+		// The native hook is intentionally silent when its exact trigger is
+		// absent (including already-signed requests).
+		return body, nil
 	}
-	billingHeader := billingBlock.String()
-	if !strings.HasPrefix(billingHeader, "x-anthropic-billing-header:") {
-		return body, fmt.Errorf("Claude cch billing block has an invalid prefix")
-	}
-	versionMatch := claudeBillingHeaderVersionPattern.FindStringSubmatch(billingHeader)
-	if len(versionMatch) != 2 {
-		return body, fmt.Errorf("Claude cch billing block has an invalid version")
-	}
-	seed, supported := claudeCCHSeedForVersion(versionMatch[1])
-	if !supported {
-		return body, fmt.Errorf("Claude cch version %s is not calibrated", versionMatch[1])
-	}
-	if matches := claudeBillingHeaderCCHPattern.FindAllStringIndex(billingHeader, -1); len(matches) != 1 {
-		return body, fmt.Errorf("Claude cch billing block contains %d signing placeholders", len(matches))
-	}
-
-	material, err := buildClaudeCCHMaterial(body, billingHeader)
+	material, err := buildClaudeCCHMaterial(body)
 	if err != nil {
 		return body, fmt.Errorf("build Claude cch projection: %w", err)
 	}
-
-	cch := fmt.Sprintf("%05x", xxHash64.Checksum(material, seed)&0xFFFFF)
-	signedBillingHeader := claudeBillingHeaderCCHPattern.ReplaceAllString(billingHeader, "${1}"+cch+"${2}")
-	signedBody, err := sjson.SetBytes(body, "system.0.text", signedBillingHeader)
-	if err != nil {
-		return body, fmt.Errorf("write Claude cch signature: %w", err)
+	version := helps.OfficialClaudeCodeOAuthProfile().Version
+	seed, supported := claudeCCHSeedForVersion(version)
+	if !supported {
+		return body, nil
 	}
+	cch := fmt.Sprintf("%05x", xxHash64.Checksum(material, seed)&0xFFFFF)
+	signedBody := bytes.Clone(body)
+	copy(signedBody[placeholderOffset:placeholderOffset+5], cch)
 	return signedBody, nil
+}
+
+// resignAnthropicMessagesBody refreshes an existing first-party CCH after the
+// proxy has applied an explicitly configured body transformation. The version
+// is read from the billing block so unknown client versions remain untouched.
+func resignAnthropicMessagesBody(body []byte) ([]byte, error) {
+	cchOffset, version, ok := findClaudeVersionedCCH(body)
+	if !ok {
+		return body, nil
+	}
+	seed, supported := claudeCCHSeedForVersion(version)
+	if !supported {
+		return body, nil
+	}
+	zeroed := bytes.Clone(body)
+	copy(zeroed[cchOffset:cchOffset+5], "00000")
+	material, err := buildClaudeCCHMaterial(zeroed)
+	if err != nil {
+		return body, fmt.Errorf("build Claude cch projection: %w", err)
+	}
+	cch := fmt.Sprintf("%05x", xxHash64.Checksum(material, seed)&0xFFFFF)
+	signedBody := bytes.Clone(body)
+	copy(signedBody[cchOffset:cchOffset+5], cch)
+	return signedBody, nil
+}
+
+func findClaudeVersionedCCH(body []byte) (int, string, bool) {
+	systemOffset := bytes.Index(body, claudeCCHSystemPattern)
+	if systemOffset < 0 {
+		return 0, "", false
+	}
+	windowEnd := systemOffset + claudeCCHSystemSearchWindow
+	if windowEnd > len(body) {
+		windowEnd = len(body)
+	}
+	window := body[systemOffset:windowEnd]
+	match := claudeBillingHeaderVersionedCCHPattern.FindSubmatchIndex(window)
+	if len(match) != 6 {
+		return 0, "", false
+	}
+	version := string(window[match[2]:match[3]])
+	cchOffset := systemOffset + match[4]
+	return cchOffset, version, true
 }
 
 func resolveClaudeKeyConfig(cfg *config.Config, auth *cliproxyauth.Auth) *config.ClaudeKey {

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	claudeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -77,6 +78,14 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	}
 	t, _ := metadata["type"].(string)
 	provider := strings.ToLower(strings.TrimSpace(t))
+	var claudeStorage *claudeauth.ClaudeTokenStorage
+	if provider == "" || provider == "claude" {
+		if storage, normalized, official, errDecode := claudeauth.DecodeTokenStorage(data); errDecode == nil && (provider == "claude" || official) {
+			provider = "claude"
+			metadata = normalized
+			claudeStorage = storage
+		}
+	}
 	if provider == "gemini" {
 		provider = "gemini-cli"
 	}
@@ -170,6 +179,8 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	a := &coreauth.Auth{
 		ID:       id,
 		Provider: provider,
+		FileName: id,
+		Storage:  claudeStorage,
 		Label:    label,
 		Prefix:   prefix,
 		Status:   status,
@@ -183,6 +194,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		Metadata:  metadata,
 		CreatedAt: now,
 		UpdatedAt: now,
+	}
+	if claudeStorage != nil {
+		claudeStorage.SetMetadata(metadata)
 	}
 	// Read priority from auth file.
 	if rawPriority, ok := metadata["priority"]; ok {

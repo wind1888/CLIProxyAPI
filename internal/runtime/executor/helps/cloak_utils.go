@@ -23,9 +23,10 @@ const maxClaudeCodeClientUserIDLength = 4096
 
 // ClaudeCodeUserID is the canonical metadata.user_id payload emitted by Claude Code.
 type ClaudeCodeUserID struct {
-	DeviceID    string `json:"device_id"`
-	AccountUUID string `json:"account_uuid"`
-	SessionID   string `json:"session_id"`
+	DeviceID        string `json:"device_id"`
+	AccountUUID     string `json:"account_uuid"`
+	SessionID       string `json:"session_id"`
+	ParentSessionID string `json:"parent_session_id,omitempty"`
 }
 
 func generateClaudeCodeDeviceIDRequired() (string, error) {
@@ -288,7 +289,12 @@ func ParseClaudeCodeClientUserID(userID string) (ClaudeCodeUserID, error) {
 	if errParent != nil || (parentSessionID != "" && !isValidClaudeCodeUUID(parentSessionID)) {
 		return ClaudeCodeUserID{}, errors.New("invalid Claude Code parent session UUID")
 	}
-	return ClaudeCodeUserID{DeviceID: deviceID, AccountUUID: accountUUID, SessionID: sessionID}, nil
+	return ClaudeCodeUserID{
+		DeviceID:        deviceID,
+		AccountUUID:     accountUUID,
+		SessionID:       sessionID,
+		ParentSessionID: parentSessionID,
+	}, nil
 }
 
 func IsValidClaudeCodeDeviceID(deviceID string) bool {

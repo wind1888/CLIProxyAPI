@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"testing"
@@ -162,6 +164,7 @@ type authFallbackExecutor struct {
 	streamCalls       []string
 	executeErrors     map[string]error
 	streamFirstErrors map[string]error
+	countTokenErrors  map[string]error
 }
 
 func (e *authFallbackExecutor) Identifier() string {
@@ -200,8 +203,14 @@ func (e *authFallbackExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, er
 	return auth, nil
 }
 
-func (e *authFallbackExecutor) CountTokens(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, &Error{HTTPStatus: 500, Message: "not implemented"}
+func (e *authFallbackExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	err := e.countTokenErrors[auth.ID]
+	e.mu.Unlock()
+	if err != nil {
+		return cliproxyexecutor.Response{}, err
+	}
+	return cliproxyexecutor.Response{Payload: []byte(auth.ID)}, nil
 }
 
 func (e *authFallbackExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
@@ -221,6 +230,27 @@ func (e *authFallbackExecutor) StreamCalls() []string {
 	defer e.mu.Unlock()
 	out := make([]string, len(e.streamCalls))
 	copy(out, e.streamCalls)
+	return out
+}
+
+type resultCaptureHook struct {
+	NoopHook
+
+	mu      sync.Mutex
+	results []Result
+}
+
+func (h *resultCaptureHook) OnResult(_ context.Context, result Result) {
+	h.mu.Lock()
+	h.results = append(h.results, result)
+	h.mu.Unlock()
+}
+
+func (h *resultCaptureHook) Results() []Result {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]Result, len(h.results))
+	copy(out, h.results)
 	return out
 }
 
@@ -1266,6 +1296,137 @@ func TestManager_MarkResult_RequestScopedNotFoundDoesNotCooldownAuth(t *testing.
 	}
 	if state := updated.ModelStates[model]; state != nil {
 		t.Fatalf("expected request-scoped 404 to avoid model cooldown state, got %#v", state)
+	}
+}
+
+func TestManager_ExecuteCount_GenericRouteNotFoundDoesNotSuspendModel(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	hook := &resultCaptureHook{}
+	m := NewManager(nil, nil, hook)
+	executor := &authFallbackExecutor{
+		id: "claude",
+		countTokenErrors: map[string]error{
+			"count-route-not-found-auth": &Error{HTTPStatus: http.StatusNotFound, Message: "404 page not found"},
+		},
+	}
+	m.RegisterExecutor(executor)
+
+	model := "count-route-not-found-model"
+	auth := &Auth{ID: "count-route-not-found-auth", Provider: "claude"}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	if _, err := m.ExecuteCount(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err == nil {
+		t.Fatal("expected count_tokens route 404 error")
+	}
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatal("expected auth to remain registered")
+	}
+	if updated.Failed != 1 || updated.Unavailable {
+		t.Fatalf("updated auth = %#v, want one neutral failure", updated)
+	}
+	if state := updated.ModelStates[model]; state != nil {
+		t.Fatalf("route 404 created model cooldown state: %#v", state)
+	}
+	if results := hook.Results(); len(results) != 1 || results[0].Error == nil || results[0].Error.HTTPStatus != http.StatusNotFound {
+		t.Fatalf("recorded results = %#v, want one failed 404", results)
+	}
+	if count := reg.GetModelCount(model); count != 1 {
+		t.Fatalf("available model count = %d, want 1", count)
+	}
+	if resp, err := m.Execute(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err != nil || string(resp.Payload) != auth.ID {
+		t.Fatalf("messages request after count route 404 = %q, %v", string(resp.Payload), err)
+	}
+}
+
+func TestManager_ExecuteCount_ExplicitModelNotFoundSuspendsModel(t *testing.T) {
+	previous := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(previous) })
+
+	hook := &resultCaptureHook{}
+	m := NewManager(nil, nil, hook)
+	model := "count-explicitly-missing-model"
+	auth := &Auth{ID: "count-model-not-found-auth", Provider: "claude"}
+	m.RegisterExecutor(&authFallbackExecutor{
+		id: "claude",
+		countTokenErrors: map[string]error{
+			auth.ID: &Error{
+				Code:       "model_not_found",
+				HTTPStatus: http.StatusNotFound,
+				Message:    `{"type":"error","error":{"type":"not_found_error","message":"model count-explicitly-missing-model was not found"}}`,
+			},
+		},
+	})
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	if _, err := m.ExecuteCount(context.Background(), []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); err == nil {
+		t.Fatal("expected count_tokens model-not-found error")
+	}
+	updated, _ := m.GetByID(auth.ID)
+	state := updated.ModelStates[model]
+	if state == nil || !state.Unavailable || state.LastError == nil || state.LastError.Code != "model_not_found" {
+		t.Fatalf("model state = %#v, want unavailable with preserved code", state)
+	}
+	if remaining := time.Until(state.NextRetryAfter); remaining < 11*time.Hour || remaining > 12*time.Hour {
+		t.Fatalf("model-not-found cooldown = %v, want about 12h", remaining)
+	}
+	if results := hook.Results(); len(results) != 1 || results[0].Error == nil || results[0].Error.Code != "model_not_found" {
+		t.Fatalf("hook results = %#v, want preserved model_not_found code", results)
+	}
+	if count := reg.GetModelCount(model); count != 0 {
+		t.Fatalf("available model count = %d, want 0", count)
+	}
+}
+
+func TestIsCountTokensEndpointNotFoundError(t *testing.T) {
+	model404 := func(message string) error {
+		return &Error{HTTPStatus: http.StatusNotFound, Message: message}
+	}
+	tests := []struct {
+		name  string
+		err   error
+		model string
+		want  bool
+	}{
+		{name: "empty router 404", err: model404(""), want: true},
+		{name: "plain router 404", err: model404("404 page not found"), want: true},
+		{name: "fastapi route 404", err: model404(`{"detail":"Not Found"}`), want: true},
+		{name: "nested generic route 404", err: model404(`{"error":{"type":"not_found_error","message":"Not Found"}}`), want: true},
+		{name: "html route 404", err: model404("<html><title>404 Not Found</title></html>"), want: true},
+		{name: "structured model 404", err: model404(`{"error":{"type":"not_found_error","message":"model claude-missing was not found"}}`), want: false},
+		{name: "exact model reference with suffix", err: model404(`{"error":{"type":"not_found_error","message":"model: claude-missing"}}`), model: "claude-missing(high)", want: false},
+		{name: "requested model does not exist", err: model404(`{"error":{"type":"not_found_error","message":"The requested model does not exist"}}`), want: false},
+		{name: "problem type URI", err: model404(`{"type":"https://example.com/problems/model-not-found","title":"Not Found"}`), want: false},
+		{name: "typed model code", err: &Error{Code: "model_not_found", HTTPStatus: http.StatusNotFound, Message: "Not Found"}, want: false},
+		{name: "wrapped structured code", err: fmt.Errorf("upstream: %w", &requestScopedStatusError{status: http.StatusNotFound, message: `{"error":{"code":"model_not_found"}}`}), want: false},
+		{name: "joined structured code", err: errors.Join(errors.New("upstream"), &requestScopedStatusError{status: http.StatusNotFound, message: `{"error":{"code":"model_not_found"}}`}), want: false},
+		{name: "unstructured model text is conservative", err: model404("model claude-missing was not found"), want: true},
+		{name: "non 404", err: &Error{HTTPStatus: http.StatusInternalServerError, Message: "404 page not found"}, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			model := tc.model
+			if model == "" {
+				model = "claude-missing"
+			}
+			if got := isCountTokensEndpointNotFoundError(tc.err, model); got != tc.want {
+				t.Fatalf("isCountTokensEndpointNotFoundError() = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
